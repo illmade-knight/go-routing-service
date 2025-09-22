@@ -34,13 +34,24 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	jwtSecret := os.Getenv("JWT_SECRET")
+	if jwtSecret == "" {
+		logger.Fatal().Msg("JWT_SECRET environment variable must be set.")
+	}
+
+	projectID := os.Getenv("GCP_PROJECT_ID")
+	if projectID == "" {
+		logger.Fatal().Msg("GCP_PROJECT_ID environment variable must be set.")
+	}
+
 	// 1. Load configuration from environment variables.
 	cfg := &routing.Config{
-		ProjectID:             os.Getenv("GCP_PROJECT_ID"),
+		ProjectID:             projectID,
 		HTTPListenAddr:        ":8082",
 		IngressSubscriptionID: "ingress-sub",
 		IngressTopicID:        "ingress-topic",
 		NumPipelineWorkers:    10,
+		JWTSecret:             jwtSecret,
 	}
 
 	// 2. Initialize external clients.

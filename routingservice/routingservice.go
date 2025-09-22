@@ -27,8 +27,8 @@ type Wrapper struct {
 func New(
 	cfg *routing.Config,
 	deps *routing.Dependencies,
-	consumer messagepipeline.MessageConsumer, // Accepts the generic consumer
-	producer routing.IngestionProducer, // Accepts the generic producer
+	consumer messagepipeline.MessageConsumer,
+	producer routing.IngestionProducer,
 	logger zerolog.Logger,
 ) (*Wrapper, error) {
 	var err error
@@ -37,27 +37,45 @@ func New(
 		NumWorkers: cfg.NumPipelineWorkers,
 	}
 
-	// The wrapper assembles the internal pipeline service...
 	processingService, err := pipeline.NewService(pipelineConfig, deps, consumer, logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create pipeline service: %w", err)
 	}
 
-	// ...and the internal API handlers, now with the message store.
-	// REFACTOR: Pass the MessageStore dependency to the API constructor.
-	apiHandler := api.NewAPI(producer, deps.MessageStore, logger)
+	apiHandler := api.NewAPI(producer, deps.MessageStore, logger, cfg.JWTSecret)
 	mux := http.NewServeMux()
 
-	// This handler does nothing, but it's needed to complete the middleware chain for OPTIONS.
-	doNothingHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
+	// THE FIX:
+	// We create a single, explicit handler for each path. This handler is
+	// responsible for routing based on the HTTP method (POST, GET, OPTIONS).
+	// This is a more robust pattern that avoids ambiguities in the default router.
 
-	// Register routes for the /send endpoint.
-	mux.Handle("OPTIONS /send", api.CorsMiddleware(doNothingHandler))
-	mux.Handle("POST /send", api.CorsMiddleware(http.HandlerFunc(apiHandler.SendHandler)))
+	// Handler for the /send endpoint
+	sendHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			// For POST requests, the chain is: JWT Auth -> SendHandler
+			apiHandler.JwtAuthMiddleware(http.HandlerFunc(apiHandler.SendHandler)).ServeHTTP(w, r)
+		} else {
+			// For all other methods (including OPTIONS), we respond with 200 OK.
+			// The CorsMiddleware has already set the necessary headers.
+			w.WriteHeader(http.StatusOK)
+		}
+	})
 
-	// REFACTOR: Register routes for the new /messages endpoint.
-	mux.Handle("OPTIONS /messages", api.CorsMiddleware(doNothingHandler))
-	mux.Handle("GET /messages", api.CorsMiddleware(http.HandlerFunc(apiHandler.GetMessagesHandler)))
+	// Handler for the /messages endpoint
+	messagesHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			// For GET requests, the chain is: JWT Auth -> GetMessagesHandler
+			apiHandler.JwtAuthMiddleware(http.HandlerFunc(apiHandler.GetMessagesHandler)).ServeHTTP(w, r)
+		} else {
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+
+	// We wrap our new, robust handlers in the CORS middleware. The CORS middleware
+	// will run first for EVERY request to these paths.
+	mux.Handle("/send", api.CorsMiddleware(sendHandler))
+	mux.Handle("/messages", api.CorsMiddleware(messagesHandler))
 
 	apiServer := &http.Server{Addr: cfg.HTTPListenAddr, Handler: mux}
 

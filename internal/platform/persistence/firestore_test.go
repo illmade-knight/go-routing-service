@@ -55,12 +55,12 @@ func setupSuite(t *testing.T) (context.Context, *testFixture) {
 func TestFirestoreStore(t *testing.T) {
 	_, fixture := setupSuite(t)
 
-	t.Run("StoreMessages", func(t *testing.T) {
-		testStoreMessages(t, fixture)
+	t.Run("StoreAndRetrieveFullCycle", func(t *testing.T) {
+		testStoreAndRetrieveFullCycle(t, fixture)
 	})
 
-	t.Run("RetrieveMessages", func(t *testing.T) {
-		testRetrieveMessages(t, fixture)
+	t.Run("RetrieveMessagesWithPreSeededData", func(t *testing.T) {
+		testRetrieveMessagesWithPreSeededData(t, fixture)
 	})
 
 	t.Run("DeleteMessages", func(t *testing.T) {
@@ -68,55 +68,64 @@ func TestFirestoreStore(t *testing.T) {
 	})
 }
 
-// testStoreMessages validates that messages are correctly stored in Firestore.
-func testStoreMessages(t *testing.T, f *testFixture) {
+// testStoreAndRetrieveFullCycle validates the full write/read cycle.
+func testStoreAndRetrieveFullCycle(t *testing.T, f *testFixture) {
+	// Arrange
+	senderURN, err := urn.Parse("urn:sm:user:sender-user")
+	require.NoError(t, err)
 	recipientURN, err := urn.Parse("urn:sm:user:store-user")
 	require.NoError(t, err)
 
 	envelopes := []*transport.SecureEnvelope{
-		{MessageID: "msg1", RecipientID: recipientURN, EncryptedData: []byte("payload1")},
-		{MessageID: "msg2", RecipientID: recipientURN, EncryptedData: []byte("payload2")},
+		{MessageID: "msg1", SenderID: senderURN, RecipientID: recipientURN, EncryptedData: []byte("payload1")},
+		{MessageID: "msg2", SenderID: senderURN, RecipientID: recipientURN, EncryptedData: []byte("payload2")},
 	}
 
-	// Act
+	// Act: Store the messages
 	err = f.store.StoreMessages(f.ctx, recipientURN, envelopes)
 	require.NoError(t, err)
 
-	// Assert
-	docs, err := f.fsClient.Collection("user-messages").Doc(recipientURN.String()).Collection("messages").Documents(f.ctx).GetAll()
+	// Assert: Retrieve the messages using the store and verify full data integrity
+	retrieved, err := f.store.RetrieveMessages(f.ctx, recipientURN)
 	require.NoError(t, err)
-	require.Len(t, docs, 2, "Expected two messages to be stored")
+	require.Len(t, retrieved, 2, "Expected two messages to be retrieved")
 
-	var found1, found2 bool
-	for _, doc := range docs {
-		var env transport.SecureEnvelope
-		err := doc.DataTo(&env)
-		require.NoError(t, err)
-		if env.MessageID == "msg1" {
-			assert.Equal(t, []byte("payload1"), env.EncryptedData)
-			found1 = true
-		}
-		if env.MessageID == "msg2" {
-			assert.Equal(t, []byte("payload2"), env.EncryptedData)
-			found2 = true
-		}
+	retrievedMap := make(map[string]*transport.SecureEnvelope)
+	for _, env := range retrieved {
+		retrievedMap[env.MessageID] = env
 	}
-	assert.True(t, found1, "Message 1 was not found")
-	assert.True(t, found2, "Message 2 was not found")
+
+	require.Contains(t, retrievedMap, "msg1")
+	assert.Equal(t, senderURN, retrievedMap["msg1"].SenderID)
+	assert.Equal(t, recipientURN, retrievedMap["msg1"].RecipientID)
+	assert.Equal(t, []byte("payload1"), retrievedMap["msg1"].EncryptedData)
+
+	require.Contains(t, retrievedMap, "msg2")
+	assert.Equal(t, senderURN, retrievedMap["msg2"].SenderID)
+	assert.Equal(t, recipientURN, retrievedMap["msg2"].RecipientID)
 }
 
-// testRetrieveMessages validates that stored messages are correctly retrieved.
-func testRetrieveMessages(t *testing.T, f *testFixture) {
+// testRetrieveMessagesWithPreSeededData validates that correctly formatted stored messages are retrieved.
+func testRetrieveMessagesWithPreSeededData(t *testing.T, f *testFixture) {
+	// Arrange: Create URNs for testing
+	senderURN, err := urn.Parse("urn:sm:user:ret-sender-user")
+	require.NoError(t, err)
 	recipientURN, err := urn.Parse("urn:sm:user:retrieve-user")
 	require.NoError(t, err)
 
-	// Arrange: Pre-populate the store with messages.
-	preEnvelopes := []*transport.SecureEnvelope{
-		{MessageID: "msg1", RecipientID: recipientURN},
-		{MessageID: "msg2", RecipientID: recipientURN},
+	// NOTE: We seed the database with a map that mimics the 'firestoreEnvelope'
+	// struct, storing URNs as strings, to simulate real-world stored data.
+	preSeededMessages := []map[string]interface{}{
+		{"messageId": "msg1", "senderId": senderURN.String(), "recipientId": recipientURN.String()},
+		{"messageId": "msg2", "senderId": senderURN.String(), "recipientId": recipientURN.String()},
 	}
-	for _, env := range preEnvelopes {
-		_, err := f.fsClient.Collection("user-messages").Doc(recipientURN.String()).Collection("messages").Doc(env.MessageID).Set(f.ctx, env)
+
+	for _, msg := range preSeededMessages {
+		_, err := f.fsClient.Collection("user-messages").
+			Doc(recipientURN.String()).
+			Collection("messages").
+			Doc(msg["messageId"].(string)).
+			Set(f.ctx, msg)
 		require.NoError(t, err)
 	}
 
@@ -124,17 +133,12 @@ func testRetrieveMessages(t *testing.T, f *testFixture) {
 	retrievedEnvelopes, err := f.store.RetrieveMessages(f.ctx, recipientURN)
 	require.NoError(t, err)
 
-	// Assert
+	// Assert: Check that the retrieved envelopes were correctly parsed back into their canonical form.
 	require.Len(t, retrievedEnvelopes, 2)
-	// REFACTOR: The assertion is now more robust. We check for the presence
-	// of the expected message IDs instead of a deep struct comparison, which
-	// avoids issues with nil vs. empty slices after serialization.
-	retrievedIDs := make(map[string]bool)
 	for _, env := range retrievedEnvelopes {
-		retrievedIDs[env.MessageID] = true
+		assert.Equal(t, recipientURN, env.RecipientID, "RecipientID was not parsed correctly")
+		assert.Equal(t, senderURN, env.SenderID, "SenderID was not parsed correctly")
 	}
-	assert.Contains(t, retrievedIDs, "msg1")
-	assert.Contains(t, retrievedIDs, "msg2")
 
 	// Test case for a user with no messages.
 	noMsgURN, err := urn.Parse("urn:sm:user:no-messages-user")
@@ -156,6 +160,9 @@ func testDeleteMessages(t *testing.T, f *testFixture) {
 		{MessageID: "msg3", RecipientID: recipientURN},
 	}
 	for _, env := range preEnvelopes {
+		// NOTE: We can still use the canonical struct here for simplicity,
+		// as Firestore's client will convert it to the map format upon Set.
+		// The important part is that the Delete logic only needs the ID.
 		_, err := f.fsClient.Collection("user-messages").Doc(recipientURN.String()).Collection("messages").Doc(env.MessageID).Set(f.ctx, env)
 		require.NoError(t, err)
 	}

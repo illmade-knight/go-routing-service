@@ -6,22 +6,28 @@ package pipeline
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 
 	"github.com/illmade-knight/go-dataflow/pkg/messagepipeline"
 	"github.com/illmade-knight/go-secure-messaging/pkg/transport"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // EnvelopeTransformer is a dataflow Transformer stage that safely unmarshals
 // and validates a raw message payload into a structured transport.SecureEnvelope.
-func EnvelopeTransformer(ctx context.Context, msg *messagepipeline.Message) (*transport.SecureEnvelope, bool, error) {
-	var envelope transport.SecureEnvelope
+func EnvelopeTransformer(_ context.Context, msg *messagepipeline.Message) (*transport.SecureEnvelope, bool, error) {
+	envelopePB := &transport.SecureEnvelopePb{}
 
-	err := json.Unmarshal(msg.Payload, &envelope)
+	err := protojson.Unmarshal(msg.Payload, envelopePB)
 	if err != nil {
-		// If unmarshaling fails, we skip the message and return an error
+		// If unmarshalling fails, we skip the message and return an error
 		// so the StreamingService can Nack it.
+		return nil, true, fmt.Errorf("failed to unmarshal secure envelope from message %s: %w", msg.ID, err)
+	}
+
+	envelope, err := transport.FromProto(envelopePB)
+	if err != nil {
+		// If we can't convert to a 'real' Envelope fail
 		return nil, true, fmt.Errorf("failed to unmarshal secure envelope from message %s: %w", msg.ID, err)
 	}
 
@@ -34,5 +40,5 @@ func EnvelopeTransformer(ctx context.Context, msg *messagepipeline.Message) (*tr
 
 	// On success, we pass the structured envelope to the next stage (the Processor)
 	// and indicate that the message should not be skipped.
-	return &envelope, false, nil
+	return envelope, false, nil
 }

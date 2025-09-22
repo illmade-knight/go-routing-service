@@ -7,14 +7,16 @@ toolchain go1.24.6
 require (
 	cloud.google.com/go/firestore v1.18.0
 	cloud.google.com/go/pubsub/v2 v2.0.0
+	github.com/golang-jwt/jwt/v5 v5.3.0
 	github.com/google/uuid v1.6.0
 	github.com/illmade-knight/go-dataflow v0.3.4-beta
-	github.com/illmade-knight/go-secure-messaging v0.0.9-beta
+	github.com/illmade-knight/go-secure-messaging v0.0.13-beta
 	github.com/illmade-knight/go-test v0.0.6
 	github.com/rs/zerolog v1.34.0
 	github.com/stretchr/testify v1.11.1
 	google.golang.org/api v0.249.0
 	google.golang.org/grpc v1.75.1
+	google.golang.org/protobuf v1.36.9
 )
 
 require (
@@ -66,6 +68,7 @@ require (
 	github.com/googleapis/enterprise-certificate-proxy v0.3.6 // indirect
 	github.com/googleapis/gax-go/v2 v2.15.0 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
+	github.com/illmade-knight/go-action-intention-protos v1.0.23 // indirect
 	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.5 // indirect
 	github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 // indirect
@@ -123,6 +126,5 @@ require (
 	google.golang.org/genproto v0.0.0-20250603155806-513f23925822 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20250818200422-3122310a409c // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250818200422-3122310a409c // indirect
-	google.golang.org/protobuf v1.36.8 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

@@ -12,6 +12,10 @@ type Config struct {
 	IngressSubscriptionID string
 	IngressTopicID        string
 	NumPipelineWorkers    int
+
+	// ADDED: The secret key for validating JWTs. It will be loaded
+	// from the "JWT_SECRET" environment variable.
+	JWTSecret string `env:"JWT_SECRET,required"`
 }
 
 // Dependencies holds all the external services the routing service needs to operate.
