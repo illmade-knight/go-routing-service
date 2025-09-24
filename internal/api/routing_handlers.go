@@ -1,8 +1,10 @@
 package api
 
 import (
+	"context"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/illmade-knight/go-microservice-base/pkg/middleware"
 	"github.com/illmade-knight/go-microservice-base/pkg/response"
@@ -99,9 +101,14 @@ func (a *API) GetMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// --- BEGIN RECOMMENDED CHANGE ---
+
+	// 1. Prepare the response payload first.
 	protoEnvelopes := make([]*transport.SecureEnvelopePb, len(idiomaticEnvelopes))
+	messageIDs := make([]string, len(idiomaticEnvelopes))
 	for i, env := range idiomaticEnvelopes {
 		protoEnvelopes[i] = transport.ToProto(env)
+		messageIDs[i] = env.MessageID
 	}
 
 	resp := &transport.SecureEnvelopeListPb{Envelopes: protoEnvelopes}
@@ -111,6 +118,25 @@ func (a *API) GetMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 2. Write the response to the client.
 	w.Header().Set("Content-Type", "application/json")
-	w.Write(jsonData)
+	if _, err := w.Write(jsonData); err != nil {
+		// If we fail to write the response, don't delete the messages.
+		logger.Error().Err(err).Msg("Failed to write messages response to client")
+		return
+	}
+
+	// 3. After a successful write, trigger deletion in the background.
+	go func() {
+		// Use a background context as the original request may have already timed out.
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := a.store.DeleteMessages(ctx, recipientURN, messageIDs); err != nil {
+			logger.Error().Err(err).Msg("Failed to delete messages from store after retrieval")
+		} else {
+			logger.Info().Int("count", len(messageIDs)).Msg("Successfully deleted messages after retrieval.")
+		}
+	}()
+
+	// --- END RECOMMENDED CHANGE ---
 }
