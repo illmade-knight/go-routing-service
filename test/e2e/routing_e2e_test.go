@@ -78,7 +78,7 @@ func TestFullStoreAndRetrieveFlow(t *testing.T) {
 
 	offlineHandled := make(chan urn.URN, 1)
 	deps := &routing.Dependencies{
-		PresenceCache:      cache.NewInMemoryCache[urn.URN, routing.ConnectionInfo](nil),
+		PresenceCache:      cache.NewInMemoryPresenceCache[urn.URN, routing.ConnectionInfo](),
 		DeviceTokenFetcher: tokenFetcher,
 		PushNotifier:       &mockPushNotifier{handled: offlineHandled},
 		MessageStore:       messageStore,

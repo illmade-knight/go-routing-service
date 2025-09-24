@@ -3,11 +3,11 @@ package pubsub
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 
 	"cloud.google.com/go/pubsub/v2"
 	"github.com/illmade-knight/go-secure-messaging/pkg/transport"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // pubsubTopicClient defines the interface for the underlying pubsub.Topic.
@@ -26,24 +26,20 @@ type Producer struct {
 // NewProducer is the constructor for the Pub/Sub producer.
 // It takes a topic client that it will publish messages to.
 func NewProducer(topic pubsubTopicClient) *Producer {
-	producer := &Producer{
+	return &Producer{
 		topic: topic,
 	}
-	return producer
 }
 
 // Publish serializes the SecureEnvelope and sends it to the message bus.
 // It conforms to the routing.IngestionProducer interface.
 func (p *Producer) Publish(ctx context.Context, envelope *transport.SecureEnvelope) error {
-	var err error
+	// CORRECTED: Convert the native Go envelope to its Protobuf representation first.
+	protoEnvelope := transport.ToProto(envelope)
 
-	// REFACTOR: The original file had a struct literal that was not a pointer.
-	// While not a style guide violation, using a pointer for the returned
-	// struct is more idiomatic for larger structs or when methods might
-	// need to modify the struct's state. Changed to return *Producer.
-
-	// Serialize the envelope to a JSON byte slice for the message payload.
-	payloadBytes, err := json.Marshal(envelope)
+	// CORRECTED: Serialize the Protobuf message using protojson, which matches
+	// the unmarshaler used by the EnvelopeTransformer.
+	payloadBytes, err := protojson.Marshal(protoEnvelope)
 	if err != nil {
 		return fmt.Errorf("failed to marshal envelope for publishing: %w", err)
 	}

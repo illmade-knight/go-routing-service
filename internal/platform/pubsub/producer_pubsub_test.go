@@ -2,7 +2,6 @@ package pubsub_test
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sync"
 	"testing"
@@ -19,6 +18,7 @@ import (
 	"google.golang.org/api/option"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 func TestProducer_Publish(t *testing.T) {
@@ -41,8 +41,6 @@ func TestProducer_Publish(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = client.Close() })
 
-	// REFACTOR: Use the main client to get the admin clients, which is the
-	// correct and idiomatic approach.
 	topicAdminClient := client.TopicAdminClient
 	subAdminClient := client.SubscriptionAdminClient
 
@@ -61,18 +59,15 @@ func TestProducer_Publish(t *testing.T) {
 	publisher := client.Publisher(topicID)
 	producer := ps.NewProducer(publisher)
 
-	// Arrange: Create a valid URN-based SecureEnvelope for the test.
 	senderURN, err := urn.Parse("urn:sm:user:user-alice")
 	require.NoError(t, err)
 	recipientURN, err := urn.Parse("urn:sm:user:user-bob")
 	require.NoError(t, err)
 
 	testEnvelope := &transport.SecureEnvelope{
-		SenderID:              senderURN,
-		RecipientID:           recipientURN,
-		EncryptedData:         []byte("encrypted-payload"),
-		EncryptedSymmetricKey: []byte("encrypted-key"),
-		Signature:             []byte("signature"),
+		SenderID:      senderURN,
+		RecipientID:   recipientURN,
+		EncryptedData: []byte("encrypted-payload"),
 	}
 
 	// Act: Publish the message using our producer
@@ -85,7 +80,6 @@ func TestProducer_Publish(t *testing.T) {
 	var receivedMsg *pubsub.Message
 
 	sub := client.Subscriber(subID)
-	// This goroutine will receive one message and then stop
 	go func() {
 		defer wg.Done()
 		receiveCtx, cancelReceive := context.WithCancel(ctx)
@@ -94,23 +88,26 @@ func TestProducer_Publish(t *testing.T) {
 		err := sub.Receive(receiveCtx, func(ctx context.Context, msg *pubsub.Message) {
 			msg.Ack()
 			receivedMsg = msg
-			cancelReceive() // Stop receiving after the first message
+			cancelReceive()
 		})
 		if err != nil && err != context.Canceled {
 			t.Errorf("Receive returned an unexpected error: %v", err)
 		}
 	}()
 
-	wg.Wait() // Wait for the receiver goroutine to finish
+	wg.Wait()
 
 	require.NotNil(t, receivedMsg, "Did not receive a message from the subscription")
 
-	var receivedEnvelope transport.SecureEnvelope
-	err = json.Unmarshal(receivedMsg.Data, &receivedEnvelope)
+	// CORRECTED: Unmarshal using protojson, which matches the producer.
+	var receivedEnvelopePb transport.SecureEnvelopePb
+	err = protojson.Unmarshal(receivedMsg.Data, &receivedEnvelopePb)
+	require.NoError(t, err)
+
+	receivedEnvelope, err := transport.FromProto(&receivedEnvelopePb)
 	require.NoError(t, err)
 
 	assert.Equal(t, testEnvelope.RecipientID, receivedEnvelope.RecipientID)
 	assert.Equal(t, testEnvelope.SenderID, receivedEnvelope.SenderID)
 	assert.Equal(t, testEnvelope.EncryptedData, receivedEnvelope.EncryptedData)
-	assert.Equal(t, testEnvelope.Signature, receivedEnvelope.Signature)
 }

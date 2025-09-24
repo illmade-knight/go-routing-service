@@ -2,12 +2,12 @@ package routingservice
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"net"
 	"net/http"
 
 	"github.com/illmade-knight/go-dataflow/pkg/messagepipeline"
+	"github.com/illmade-knight/go-microservice-base/pkg/microservice"
+	"github.com/illmade-knight/go-microservice-base/pkg/middleware"
 	"github.com/illmade-knight/go-routing-service/internal/api"
 	"github.com/illmade-knight/go-routing-service/internal/pipeline"
 	"github.com/illmade-knight/go-routing-service/pkg/routing"
@@ -15,15 +15,15 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// Wrapper encapsulates all components of the running service.
+// Wrapper now embeds BaseServer to get standard server functionality.
 type Wrapper struct {
+	*microservice.BaseServer
 	cfg               *routing.Config
-	apiServer         *http.Server
 	processingService *messagepipeline.StreamingService[transport.SecureEnvelope]
 	logger            zerolog.Logger
 }
 
-// New creates and wires up the entire routing service.
+// New creates and wires up the entire routing service using the base server.
 func New(
 	cfg *routing.Config,
 	deps *routing.Dependencies,
@@ -31,115 +31,75 @@ func New(
 	producer routing.IngestionProducer,
 	logger zerolog.Logger,
 ) (*Wrapper, error) {
-	var err error
 
+	// 1. Create the standard base server. It includes /healthz, /readyz, /metrics.
+	baseServer := microservice.NewBaseServer(logger, cfg.HTTPListenAddr)
+
+	// 2. Create the core message processing pipeline.
 	pipelineConfig := pipeline.Config{
 		NumWorkers: cfg.NumPipelineWorkers,
 	}
-
 	processingService, err := pipeline.NewService(pipelineConfig, deps, consumer, logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create pipeline service: %w", err)
 	}
 
-	apiHandler := api.NewAPI(producer, deps.MessageStore, logger, cfg.JWTSecret)
-	mux := http.NewServeMux()
+	// 3. Create service-specific API handlers.
+	apiHandler := api.NewAPI(producer, deps.MessageStore, logger)
 
-	// THE FIX:
-	// We create a single, explicit handler for each path. This handler is
-	// responsible for routing based on the HTTP method (POST, GET, OPTIONS).
-	// This is a more robust pattern that avoids ambiguities in the default router.
+	// 4. Get the mux and middleware from the base library.
+	mux := baseServer.Mux()
+	jwtAuth := middleware.NewJWTAuthMiddleware(cfg.JWTSecret)
+	cors := middleware.NewCorsMiddleware(cfg.Cors)
 
-	// Handler for the /send endpoint
-	sendHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
-			// For POST requests, the chain is: JWT Auth -> SendHandler
-			apiHandler.JwtAuthMiddleware(http.HandlerFunc(apiHandler.SendHandler)).ServeHTTP(w, r)
-		} else {
-			// For all other methods (including OPTIONS), we respond with 200 OK.
-			// The CorsMiddleware has already set the necessary headers.
-			w.WriteHeader(http.StatusOK)
-		}
+	// 5. Register service-specific routes with the centralized middleware.
+	mux.Handle("POST /send", cors(jwtAuth(http.HandlerFunc(apiHandler.SendHandler))))
+	mux.Handle("GET /messages", cors(jwtAuth(http.HandlerFunc(apiHandler.GetMessagesHandler))))
+
+	// CORRECTED: Add explicit handlers for preflight OPTIONS requests.
+	// These handlers only need to run the CORS middleware to return the correct headers.
+	preflightHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
 	})
+	mux.Handle("OPTIONS /send", cors(preflightHandler))
+	mux.Handle("OPTIONS /messages", cors(preflightHandler))
 
-	// Handler for the /messages endpoint
-	messagesHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet {
-			// For GET requests, the chain is: JWT Auth -> GetMessagesHandler
-			apiHandler.JwtAuthMiddleware(http.HandlerFunc(apiHandler.GetMessagesHandler)).ServeHTTP(w, r)
-		} else {
-			w.WriteHeader(http.StatusOK)
-		}
-	})
-
-	// We wrap our new, robust handlers in the CORS middleware. The CORS middleware
-	// will run first for EVERY request to these paths.
-	mux.Handle("/send", api.CorsMiddleware(sendHandler))
-	mux.Handle("/messages", api.CorsMiddleware(messagesHandler))
-
-	apiServer := &http.Server{Addr: cfg.HTTPListenAddr, Handler: mux}
-
-	wrapper := &Wrapper{
+	return &Wrapper{
+		BaseServer:        baseServer,
 		cfg:               cfg,
-		apiServer:         apiServer,
 		processingService: processingService,
 		logger:            logger,
-	}
-	return wrapper, nil
+	}, nil
 }
 
-// Start runs the service's background components.
+// Start runs the service's background components before starting the base HTTP server.
 func (w *Wrapper) Start(ctx context.Context) error {
-	w.logger.Info().Msg("Core processing pipeline starting.")
-	err := w.processingService.Start(ctx)
-	if err != nil {
+	w.logger.Info().Msg("Core processing pipeline starting...")
+	if err := w.processingService.Start(ctx); err != nil {
 		return fmt.Errorf("failed to start processing service: %w", err)
 	}
 
-	listener, err := net.Listen("tcp", w.cfg.HTTPListenAddr)
-	if err != nil {
-		return fmt.Errorf("failed to listen on http address: %w", err)
-	}
-	w.apiServer.Addr = listener.Addr().String()
+	w.SetReady(true)
+	w.logger.Info().Msg("Service is now ready.")
 
-	go func() {
-		w.logger.Info().Str("address", w.apiServer.Addr).Msg("HTTP server starting.")
-		if err := w.apiServer.Serve(listener); !errors.Is(err, http.ErrServerClosed) {
-			w.logger.Fatal().Err(err).Msg("HTTP server failed")
-		}
-	}()
-	return nil
+	return w.BaseServer.Start()
 }
 
-// GetHTTPPort returns the resolved address the HTTP server is listening on.
-func (w *Wrapper) GetHTTPPort() string {
-	if w.apiServer != nil && w.apiServer.Addr != "" {
-		_, port, err := net.SplitHostPort(w.apiServer.Addr)
-		if err == nil {
-			return ":" + port
-		}
-	}
-	return ""
-}
-
-// Shutdown gracefully stops all service components.
+// Shutdown gracefully stops all service components in the correct order.
 func (w *Wrapper) Shutdown(ctx context.Context) error {
 	w.logger.Info().Msg("Shutting down service components...")
 	var finalErr error
 
-	if err := w.apiServer.Shutdown(ctx); err != nil {
-		w.logger.Error().Err(err).Msg("HTTP server shutdown failed.")
-		finalErr = err
-	}
 	if err := w.processingService.Stop(ctx); err != nil {
 		w.logger.Error().Err(err).Msg("Processing service shutdown failed.")
 		finalErr = err
 	}
+
+	if err := w.BaseServer.Shutdown(ctx); err != nil {
+		w.logger.Error().Err(err).Msg("HTTP server shutdown failed.")
+		finalErr = err
+	}
+
 	w.logger.Info().Msg("Service shutdown complete.")
 	return finalErr
-}
-
-// Handler returns the underlying http.Handler for the service.
-func (w *Wrapper) Handler() http.Handler {
-	return w.apiServer.Handler
 }

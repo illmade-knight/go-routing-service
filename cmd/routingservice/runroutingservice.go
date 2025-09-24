@@ -1,15 +1,15 @@
-// REFACTOR: This file is updated to correctly instantiate dependencies with the
-// new urn.URN type, completing the URN migration. The mock implementations
-// have also been updated to correctly handle the URN type in their logging.
-
+// REFACTOR: This file is updated to implement the "Dual Server" architecture
+// while preserving the original, working dependency injection and configuration logic.
 package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"log"
+	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -18,79 +18,69 @@ import (
 	"cloud.google.com/go/pubsub/v2/apiv1/pubsubpb"
 	"github.com/illmade-knight/go-dataflow/pkg/cache"
 	"github.com/illmade-knight/go-dataflow/pkg/messagepipeline"
+	"github.com/illmade-knight/go-microservice-base/pkg/middleware"
 	"github.com/illmade-knight/go-routing-service/internal/platform/persistence"
 	psadapter "github.com/illmade-knight/go-routing-service/internal/platform/pubsub"
+	"github.com/illmade-knight/go-routing-service/internal/platform/websocket"
+	"github.com/illmade-knight/go-routing-service/internal/realtime"
 	"github.com/illmade-knight/go-routing-service/pkg/routing"
 	"github.com/illmade-knight/go-routing-service/routingservice"
 	"github.com/illmade-knight/go-secure-messaging/pkg/transport"
 	"github.com/illmade-knight/go-secure-messaging/pkg/urn"
 	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 )
 
-// main is the entry point for the routing service application.
-// It initializes all components, starts the service, and handles graceful shutdown.
 func main() {
 	logger := zerolog.New(os.Stdout).With().Timestamp().Logger()
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// --- 1. Configuration (PRESERVED) ---
 	jwtSecret := os.Getenv("JWT_SECRET")
 	if jwtSecret == "" {
 		logger.Fatal().Msg("JWT_SECRET environment variable must be set.")
 	}
-
 	projectID := os.Getenv("GCP_PROJECT_ID")
 	if projectID == "" {
 		logger.Fatal().Msg("GCP_PROJECT_ID environment variable must be set.")
 	}
 
-	// 1. Load configuration from environment variables.
 	cfg := &routing.Config{
 		ProjectID:             projectID,
 		HTTPListenAddr:        ":8082",
+		WebSocketListenAddr:   ":8083",
 		IngressSubscriptionID: "ingress-sub",
 		IngressTopicID:        "ingress-topic",
 		NumPipelineWorkers:    10,
 		JWTSecret:             jwtSecret,
+		Cors: middleware.CorsConfig{
+			AllowedOrigins: []string{"http://localhost:4200"}, // Example, should be configurable
+			Role:           middleware.CorsRoleAdmin,
+		},
 	}
 
-	// 2. Initialize external clients.
+	// --- 2. Dependency Injection (PRESERVED & EXTENDED) ---
 	psClient, err := pubsub.NewClient(ctx, cfg.ProjectID)
 	if err != nil {
-		log.Fatalf("Failed to create pubsub client: %v", err)
+		logger.Fatal().Err(err).Msg("Failed to create pubsub client")
 	}
 	defer psClient.Close()
 
 	fsClient, err := firestore.NewClient(ctx, cfg.ProjectID)
 	if err != nil {
-		log.Fatalf("Failed to create firestore client: %v", err)
+		logger.Fatal().Err(err).Msg("Failed to create firestore client")
 	}
 	defer fsClient.Close()
 
-	// 2.a [Temporary] Ensure topic and subscription exist for development.
-	topicAdminClient := psClient.TopicAdminClient
-	subAdminClient := psClient.SubscriptionAdminClient
-	topicID := fmt.Sprintf("projects/%s/topics/%s", cfg.ProjectID, cfg.IngressTopicID)
-	_, err = topicAdminClient.CreateTopic(ctx, &pubsubpb.Topic{
-		Name: topicID,
-	})
-	if err != nil {
-		log.Printf("failed to create topic, may already exist: %v", err)
-	}
-	subID := fmt.Sprintf("projects/%s/subscriptions/%s", cfg.ProjectID, cfg.IngressSubscriptionID)
-	_, err = subAdminClient.CreateSubscription(ctx, &pubsubpb.Subscription{
-		Name:  subID,
-		Topic: topicID,
-	})
-	if err != nil {
-		log.Printf("failed to create subscription, may already exist: %v", err)
-	}
+	// Pub/Sub resource creation for development (PRESERVED)
+	createPubsubResources(ctx, psClient, cfg.ProjectID, cfg.IngressTopicID, cfg.IngressSubscriptionID, logger)
 
-	// 3. Instantiate CONCRETE adapters using the real clients.
+	// Concrete adapters (PRESERVED)
 	consumerConfig := messagepipeline.NewGooglePubsubConsumerDefaults(cfg.IngressSubscriptionID)
 	consumer, err := messagepipeline.NewGooglePubsubConsumer(consumerConfig, psClient, logger)
 	if err != nil {
-		log.Fatalf("Failed to create pubsub consumer: %v", err)
+		logger.Fatal().Err(err).Msg("Failed to create pubsub consumer")
 	}
 
 	ingestionPublisher := psClient.Publisher(cfg.IngressTopicID)
@@ -98,60 +88,115 @@ func main() {
 
 	messageStore, err := persistence.NewFirestoreStore(fsClient, logger)
 	if err != nil {
-		log.Fatalf("Failed to create firestore message store: %v", err)
+		logger.Fatal().Err(err).Msg("Failed to create firestore message store")
 	}
 
-	// 4. Create other real dependencies.
-	// REFACTOR: Instantiate caches with the correct urn.URN key type.
+	// ADDED: Create the concrete WebSocket DeliveryProducer
+	deliveryProducer := websocket.NewDeliveryProducer(nil, logger)
+
 	deps := &routing.Dependencies{
-		PresenceCache:      cache.NewInMemoryCache[urn.URN, routing.ConnectionInfo](nil),
-		DeviceTokenFetcher: cache.NewInMemoryCache[urn.URN, []routing.DeviceToken](nil),
-		DeliveryProducer:   &mockDeliveryProducer{}, // Placeholder
-		PushNotifier:       &mockPushNotifier{},     // Placeholder
+		PresenceCache:      cache.NewInMemoryPresenceCache[urn.URN, routing.ConnectionInfo](),
+		DeviceTokenFetcher: &mockDeviceTokenFetcher{},
+		DeliveryProducer:   deliveryProducer, // Inject the new producer
+		PushNotifier:       &mockPushNotifier{},
 		MessageStore:       messageStore,
 	}
 
-	// 5. Create the service using the public wrapper, injecting all dependencies.
-	service, err := routingservice.New(cfg, deps, consumer, ingestionProducer, logger)
+	// --- 3. Service Initialization (CHANGED for Dual Server) ---
+
+	// A. The STATELESS API Service
+	apiService, err := routingservice.New(cfg, deps, consumer, ingestionProducer, logger)
 	if err != nil {
-		log.Fatalf("Failed to create service: %v", err)
+		logger.Fatal().Err(err).Msg("Failed to create API service")
 	}
 
-	// 6. Start the service and handle graceful shutdown.
+	// B. The STATEFUL WebSocket Service
+	connManager := realtime.NewConnectionManager(
+		cfg.WebSocketListenAddr,
+		cfg.JWTSecret,
+		deps.PresenceCache,
+		deliveryProducer,
+		logger,
+	)
+	deliveryProducer.SetConnectionManager(connManager) // Complete wiring
+
+	// --- 4. Concurrent Start (CHANGED for Dual Server) ---
+	var wg sync.WaitGroup
+	wg.Add(2)
+
 	go func() {
-		if err := service.Start(ctx); err != nil {
-			logger.Error().Err(err).Msg("Service failed to start")
-			stop()
+		defer wg.Done()
+		logger.Info().Str("address", cfg.HTTPListenAddr).Msg("Starting API service...")
+		if err := apiService.Start(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error().Err(err).Msg("API service failed")
+			stop() // Signal other services to stop
 		}
 	}()
 
-	logger.Info().Msg("Routing service started. Press Ctrl+C to shut down.")
-	<-ctx.Done() // Wait for shutdown signal
+	go func() {
+		defer wg.Done()
+		logger.Info().Str("address", cfg.WebSocketListenAddr).Msg("Starting WebSocket service...")
+		if err := connManager.Start(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error().Err(err).Msg("WebSocket service failed")
+			stop() // Signal other services to stop
+		}
+	}()
 
-	logger.Info().Msg("Shutdown signal received. Gracefully stopping service...")
+	// --- 5. Graceful Shutdown (CHANGED for Dual Server) ---
+	<-ctx.Done()
+	logger.Info().Msg("Shutdown signal received...")
+
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	if err := service.Shutdown(shutdownCtx); err != nil {
-		logger.Fatal().Err(err).Msg("Service shutdown failed.")
+	// Shutdown servers in parallel
+	var shutdownWg sync.WaitGroup
+	shutdownWg.Add(2)
+
+	go func() {
+		defer shutdownWg.Done()
+		if err := apiService.Shutdown(shutdownCtx); err != nil {
+			logger.Error().Err(err).Msg("API service shutdown failed")
+		}
+	}()
+
+	go func() {
+		defer shutdownWg.Done()
+		if err := connManager.Shutdown(shutdownCtx); err != nil {
+			logger.Error().Err(err).Msg("Connection manager shutdown failed")
+		}
+	}()
+
+	shutdownWg.Wait()
+	wg.Wait()
+	logger.Info().Msg("All services stopped gracefully.")
+}
+
+// --- Helper Functions and Mocks (PRESERVED) ---
+
+func createPubsubResources(ctx context.Context, psClient *pubsub.Client, projectID, topicID, subID string, logger zerolog.Logger) {
+	topicAdminClient := psClient.TopicAdminClient
+	subAdminClient := psClient.SubscriptionAdminClient
+	topicName := fmt.Sprintf("projects/%s/topics/%s", projectID, topicID)
+	if _, err := topicAdminClient.CreateTopic(ctx, &pubsubpb.Topic{Name: topicName}); err != nil {
+		logger.Warn().Err(err).Msg("Failed to create topic, may already exist")
 	}
-
-	logger.Info().Msg("Service stopped gracefully.")
+	subName := fmt.Sprintf("projects/%s/subscriptions/%s", projectID, subID)
+	if _, err := subAdminClient.CreateSubscription(ctx, &pubsubpb.Subscription{Name: subName, Topic: topicName}); err != nil {
+		logger.Warn().Err(err).Msg("Failed to create subscription, may already exist")
+	}
 }
 
-// mockDeliveryProducer and mockPushNotifier are placeholders for the main executable.
-type mockDeliveryProducer struct{}
+type mockDeviceTokenFetcher struct{}
 
-func (m *mockDeliveryProducer) Publish(ctx context.Context, topicID string, data *transport.SecureEnvelope) error {
-	// REFACTOR: Use the .String() method to correctly log the URN.
-	log.Printf("MOCK: Publishing to delivery topic %s for user %s", topicID, data.RecipientID.String())
-	return nil
+func (m *mockDeviceTokenFetcher) Fetch(ctx context.Context, key urn.URN) ([]routing.DeviceToken, error) {
+	return nil, errors.New("not implemented")
 }
+func (m *mockDeviceTokenFetcher) Close() error { return nil }
 
 type mockPushNotifier struct{}
 
 func (m *mockPushNotifier) Notify(_ context.Context, tokens []routing.DeviceToken, envelope *transport.SecureEnvelope) error {
-	// REFACTOR: Use the .String() method to correctly log the URN.
-	log.Printf("MOCK: Sending push notification to %d devices for user %s", len(tokens), envelope.RecipientID.String())
+	log.Info().Msgf("MOCK: Pushing to %d devices for %s", len(tokens), envelope.RecipientID.String())
 	return nil
 }

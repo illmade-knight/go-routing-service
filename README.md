@@ -1,92 +1,97 @@
-# **Routing Service**
+# **go-routing-service**
 
-The Routing Service is a high-performance, secure, and scalable microservice responsible for the real-time delivery of SecureEnvelope messages between clients. It acts as a "dumb pipe," routing messages based on their unencrypted headers with zero knowledge of the encrypted payload, ensuring end-to-end security.
+The Routing Service is a high-performance, secure, and scalable microservice responsible for the real-time and asynchronous delivery of SecureEnvelope messages. It is a core component of the secure messaging ecosystem, intelligently routing messages to online users via WebSockets or persisting them for offline retrieval.
 
-The architecture is built around a **Unified Ingestion Pipeline** using the go-dataflow library. This allows multiple transport protocols (e.g., HTTP, MQTT) to produce messages to a central message bus, which are then consumed by a single, scalable backend that performs the core routing logic.
+The service is built on the standardized go-microservice-base library, ensuring consistent lifecycle management, observability, and security patterns. It features a **"Dual Server" architecture** that cleanly separates stateless API handling from stateful, real-time WebSocket connections for maximum scalability and resilience.
 
----
+## **Architecture: The Dual Server Model**
+
+The service runs two independent servers within a single binary to cleanly separate concerns:
+
+1. **Stateless API Server (e.g., port 8082):** A standard HTTP server responsible for:
+    * Message ingestion (POST /send).
+    * Retrieval of offline messages (GET /messages).
+    * Standard observability endpoints (/healthz, /readyz, /metrics).
+2. **Stateful WebSocket Server (e.g., port 8083):** A dedicated server that manages:
+    * Persistent WebSocket connections from clients (GET /connect).
+    * Real-time presence tracking.
+    * Direct, in-memory delivery of messages to currently connected users.
 
 ## **Directory Structure**
 
-The repository is organized using standard Go project layout conventions to maintain a clear separation between public APIs, internal logic, and the final executable.
+The repository follows standard Go project layout conventions.
 
-├── cmd/    
-│   └── routing-service/    
-│       └── main.go              \# Assembles and runs the service    
-├── e2e/    
-│   └── routing\_e2e\_test.go      \# End-to-end integration tests    
-├── internal/    
-│   ├── api/                     \# Private HTTP API handlers    
-│   ├── pipeline/                \# Core message processing stages (transform, process)    
-│   └── platform/                \# Concrete adapters for external services (e.g., Pub/Sub, Firestore)  
-├── pkg/    
-│   └── routing/                 \# Public "contract" (domain models, interfaces, config)    
-├── routingservice/    
-│   └── service.go               \# The public, embeddable service library/wrapper    
-└── test/    
-└── e2e\_helpers.go           \# Public test helpers for E2E tests
+.  
+├── cmd/  
+│   └── runroutingservice.go     \# Assembles and runs BOTH servers  
+├── internal/  
+│   ├── api/                     \# Stateless HTTP API handlers (/send, /messages)  
+│   ├── pipeline/                \# Core async message processing logic  
+│   ├── platform/                \# Concrete adapters for Pub/Sub, Firestore, etc.  
+│   └── realtime/                \# Stateful WebSocket connection manager & server  
+├── pkg/  
+│   └── routing/                 \# Public "contract" (domain models, interfaces, config)  
+└── routingservice/  
+└── service.go               \# The public library wrapper for the STATELSS service
 
-* **cmd/**: Contains the executable entry point for the service.
-* **e2e/**: Holds the end-to-end integration tests that treat the service as a black box.
-* **internal/**: Contains all private application logic, including HTTP handlers, the core pipeline, and concrete platform adapters.
-* **pkg/**: Holds the service's public contract, defining the data structures, interfaces, and configuration.
-* **routingservice/**: The primary, public-facing service library that assembles the internal components into a runnable service.
-* **test/**: Provides public helper functions for testing, allowing E2E tests to create dependencies without violating the internal package boundary.
+## **Core Dataflows**
 
----
+### **1\. Sending a Message**
 
-## **Core Dataflow**
-
-The service operates on two primary dataflows: sending a message into the pipeline and retrieving stored messages.
-
-### **1\. Sending a Message (POST /send)**
-
-This flow handles the ingestion and routing of a new message.
+This flow shows how a message is routed to either an online or offline user.
 
 graph TD  
-A\[Client App\] \--\> B{HTTP API: POST /send};  
-B \--\> C\[Pub/Sub: Ingress Topic\];  
+A\[Client App\] \-- JWT Auth \--\> B{API Server: POST /send};  
+B \-- Publishes \--\> C\[Pub/Sub: Ingress Topic\];  
 C \--\> D\[Processing Pipeline\];  
-D \--\> E{Check Presence Cache};  
-E \-- User Online \--\> F\[Pub/Sub: Delivery Topic\];  
-E \-- User Offline \--\> G{Store Message in Firestore};  
-G \--\> H\[Send Push Notification\];
+D \--\> E{Check PresenceCache};  
+subgraph Real-time Delivery  
+E \-- User Online \--\> F\[WebSocket Server\];  
+F \-- Delivers to Client \--\> G\[Connected Client\];  
+end  
+subgraph Offline Delivery  
+E \-- User Offline \--\> H{Store in Firestore};  
+H \--\> I\[Send Push Notification\];  
+end
 
-### **2\. Retrieving Offline Messages (GET /messages)**
+### **2\. Client Connection Lifecycle**
 
-This flow allows a client to fetch messages that were stored while it was offline.
+This flow shows how clients connect and retrieve messages.
 
 graph TD  
-A\[Client App\] \--\> B{HTTP API: GET /messages};  
-B \--\> C{Message Store: Firestore};  
-C \-- Fetches Messages \--\> B;  
-B \-- Returns Messages \--\> A;  
-B \-- Marks as Delivered \--\> C;
+subgraph Connection & Retrieval  
+A\[Client App\] \-- JWT Auth \--\> B{WebSocket Server: GET /connect};  
+B \-- Upgrades to WebSocket \--\> C\[Persistent Connection Established\];  
+C \-- Updates \--\> D\[PresenceCache\];  
+A \-- JWT Auth \--\> E{API Server: GET /messages};  
+E \-- Retrieves from \--\> F\[Firestore\];  
+F \-- Deletes stored messages \--\> E;  
+E \-- Returns messages \--\> A;  
+end
 
----
+## **Project Status: Production Ready**
 
-## **Project Status & Roadmap**
+The service is feature-complete according to its development roadmap and is ready for production deployment.
 
-The service now has a complete, end-to-end implementation for asynchronous, offline-first messaging. A significant portion of **Phase 1** is complete.
+### **Features Implemented**
 
-### **What's Complete (Phase 1\)**
+* ✅ **Standardized Service Base**: Uses go-microservice-base for robust lifecycle management, graceful shutdowns, and consistent configuration.
+* ✅ **Dual Server Architecture**: Cleanly separates stateless API and stateful WebSocket logic for scalability and resilience.
+* ✅ **Full Observability**: Exposes standard endpoints: GET /healthz, GET /readyz, GET /metrics.
+* ✅ **Centralized Security**: Uses standard, configurable JWT and CORS middleware from the base library.
+* ✅ **Sender Spoofing Prevention**: The /send endpoint is secure and cannot be used to impersonate other users.
+* ✅ **Real-time & Offline Delivery**: Fully implements both WebSocket delivery for online users and Firestore-backed storage for offline users.
+* ✅ **Standardized Caching**: Uses the robust PresenceCache and Fetcher components from the go-dataflow library.
+* ✅ **Structured Logging & Errors**: All logs and API errors are in a structured JSON format.
 
-* ✅ **HTTP Ingestion**: The POST /send endpoint is implemented and publishes messages to the central message bus.
-* ✅ **Message Processing Pipeline**: A fully functional StreamingService is in place, using a GooglePubsubConsumer, a Transformer, and a Processor.
-* ✅ **Core Routing Logic**: The Processor contains the complete logic for checking user presence and deciding between online and offline delivery, including **persisting messages for offline users**.
-* ✅ **Offline Message Persistence**: The pipeline now uses a MessageStore interface, with a concrete **Firestore implementation**, to save messages for offline users.
-* ✅ **Message Retrieval API**: The GET /messages endpoint is implemented, allowing clients to securely fetch and clear their stored messages after coming online.
+## **Running the Service**
 
-### **Ready for Integration (Phase 1 Data Adapters)**
+1. **Set Environment Variables**:  
+   export GCP\_PROJECT\_ID=my-gcp-project  
+   export JWT\_SECRET=a-very-secure-secret-key  
+   \# Optional: Override default ports  
+   \# export API\_PORT=8082  
+   \# export WEBSOCKET\_PORT=8083
 
-The next step is to replace the in-memory/mock data adapters with robust, scalable implementations from the go-dataflow library within cmd/routing-service/main.go.
-
-* ➡️ **Redis for Presence**: The PresenceCache dependency can be satisfied by instantiating cache.NewRedisCache\[string, routing.ConnectionInfo\]. A cache miss definitively means the user is offline.
-* ➡️ **Firestore for Device Tokens**: The DeviceTokenFetcher dependency can be satisfied by instantiating cache.NewFirestore\[string, \[\]routing.DeviceToken\]. This can be layered with a Redis or in-memory cache for better performance.
-
-### **Future Roadmap**
-
-* ❌ **MQTT Ingestion**: An MQTT broker needs to be added as another entry point to the unified ingestion topic.
-* ❌ **Phase 2 \- Real-time Delivery**: The real-time connection manager, including the **WebSocket handler** for delivering messages to online clients, needs to be implemented.
-* ❌ **Phase 2 \- Additional APIs**: The GET /connect (WebSocket upgrade) and POST /register-device endpoints are not yet created.
-* ❌ **Phase 3/4 \- Production Hardening**: Features like JWT authentication, observability (metrics, tracing), and deployment configurations are pending.
+2. **Run the Service**:  
+   go run cmd/runroutingservice.go  

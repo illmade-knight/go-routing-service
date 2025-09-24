@@ -2,6 +2,7 @@ package routing
 
 import (
 	"github.com/illmade-knight/go-dataflow/pkg/cache"
+	"github.com/illmade-knight/go-microservice-base/pkg/middleware"
 	"github.com/illmade-knight/go-secure-messaging/pkg/urn"
 )
 
@@ -9,19 +10,17 @@ import (
 type Config struct {
 	ProjectID             string
 	HTTPListenAddr        string
+	WebSocketListenAddr   string
 	IngressSubscriptionID string
 	IngressTopicID        string
 	NumPipelineWorkers    int
-
-	// ADDED: The secret key for validating JWTs. It will be loaded
-	// from the "JWT_SECRET" environment variable.
-	JWTSecret string `env:"JWT_SECRET,required"`
+	JWTSecret             string `env:"JWT_SECRET,required"`
+	Cors                  middleware.CorsConfig
 }
 
 // Dependencies holds all the external services the routing service needs to operate.
 type Dependencies struct {
-	// REFACTOR: The generic caches now use urn.URN as the key for type safety.
-	PresenceCache      cache.Fetcher[urn.URN, ConnectionInfo]
+	PresenceCache      cache.PresenceCache[urn.URN, ConnectionInfo]
 	DeviceTokenFetcher cache.Fetcher[urn.URN, []DeviceToken]
 	DeliveryProducer   DeliveryProducer
 	PushNotifier       PushNotifier

@@ -18,6 +18,7 @@ import (
 
 // --- Mocks using testify/mock ---
 
+// mockFetcher is used for the read-only deviceTokenFetcher dependency.
 type mockFetcher[K comparable, V any] struct {
 	mock.Mock
 }
@@ -36,6 +37,35 @@ func (m *mockFetcher[K, V]) Close() error {
 	return args.Error(0)
 }
 
+// REFACTOR: Create a new mock that correctly implements the cache.PresenceCache interface.
+type mockPresenceCache[K comparable, V any] struct {
+	mock.Mock
+}
+
+func (m *mockPresenceCache[K, V]) Set(ctx context.Context, key K, value V) error {
+	args := m.Called(ctx, key, value)
+	return args.Error(0)
+}
+
+func (m *mockPresenceCache[K, V]) Fetch(ctx context.Context, key K) (V, error) {
+	args := m.Called(ctx, key)
+	var result V
+	if val, ok := args.Get(0).(V); ok {
+		result = val
+	}
+	return result, args.Error(1)
+}
+
+func (m *mockPresenceCache[K, V]) Delete(ctx context.Context, key K) error {
+	args := m.Called(ctx, key)
+	return args.Error(0)
+}
+
+func (m *mockPresenceCache[K, V]) Close() error {
+	args := m.Called()
+	return args.Error(0)
+}
+
 type mockDeliveryProducer struct {
 	mock.Mock
 }
@@ -47,6 +77,7 @@ func (m *mockDeliveryProducer) Publish(ctx context.Context, topicID string, data
 
 type mockPushNotifier struct {
 	mock.Mock
+	notified chan struct{}
 }
 
 func (m *mockPushNotifier) Notify(ctx context.Context, tokens []routing.DeviceToken, envelope *transport.SecureEnvelope) error {
@@ -58,7 +89,6 @@ type mockMessageStore struct {
 	mock.Mock
 }
 
-// REFACTOR: Implement the new routing.MessageStore interface.
 func (m *mockMessageStore) StoreMessages(ctx context.Context, recipient urn.URN, envelopes []*transport.SecureEnvelope) error {
 	args := m.Called(ctx, recipient, envelopes)
 	return args.Error(0)
@@ -66,7 +96,6 @@ func (m *mockMessageStore) StoreMessages(ctx context.Context, recipient urn.URN,
 
 func (m *mockMessageStore) RetrieveMessages(ctx context.Context, recipient urn.URN) ([]*transport.SecureEnvelope, error) {
 	args := m.Called(ctx, recipient)
-	// Type assertion to handle the slice of pointers.
 	var result []*transport.SecureEnvelope
 	if val, ok := args.Get(0).([]*transport.SecureEnvelope); ok {
 		result = val
@@ -86,7 +115,6 @@ func TestRoutingProcessor(t *testing.T) {
 	t.Cleanup(cancel)
 
 	nopLogger := zerolog.Nop()
-	// REFACTOR: Use a valid URN for the test envelope.
 	testURN, err := urn.Parse("urn:sm:user:user-bob")
 	require.NoError(t, err)
 
@@ -97,10 +125,9 @@ func TestRoutingProcessor(t *testing.T) {
 
 	t.Run("Happy Path - User is Online", func(t *testing.T) {
 		// Arrange
-		// REFACTOR: Mocks are now parameterized with the urn.URN type.
-		presenceCache := new(mockFetcher[urn.URN, routing.ConnectionInfo])
+		// REFACTOR: Use the new mockPresenceCache.
+		presenceCache := new(mockPresenceCache[urn.URN, routing.ConnectionInfo])
 		deliveryProducer := new(mockDeliveryProducer)
-		// These mocks are not used in this path.
 		deviceTokenFetcher := new(mockFetcher[urn.URN, []routing.DeviceToken])
 		pushNotifier := new(mockPushNotifier)
 		messageStore := new(mockMessageStore)
@@ -121,15 +148,14 @@ func TestRoutingProcessor(t *testing.T) {
 
 	t.Run("Happy Path - User is Offline with Device Tokens", func(t *testing.T) {
 		// Arrange
-		presenceCache := new(mockFetcher[urn.URN, routing.ConnectionInfo])
+		presenceCache := new(mockPresenceCache[urn.URN, routing.ConnectionInfo])
 		deviceTokenFetcher := new(mockFetcher[urn.URN, []routing.DeviceToken])
 		messageStore := new(mockMessageStore)
 		pushNotifier := new(mockPushNotifier)
-		deliveryProducer := new(mockDeliveryProducer) // Not used
+		deliveryProducer := new(mockDeliveryProducer)
 		deviceTokens := []routing.DeviceToken{{Token: "device-abc"}}
 
 		presenceCache.On("Fetch", mock.Anything, testURN).Return(routing.ConnectionInfo{}, errors.New("not found"))
-		// REFACTOR: Expect a call to StoreMessages with the correct arguments.
 		messageStore.On("StoreMessages", mock.Anything, testURN, []*transport.SecureEnvelope{testEnvelope}).Return(nil)
 		deviceTokenFetcher.On("Fetch", mock.Anything, testURN).Return(deviceTokens, nil)
 		pushNotifier.On("Notify", mock.Anything, deviceTokens, testEnvelope).Return(nil)
@@ -146,10 +172,10 @@ func TestRoutingProcessor(t *testing.T) {
 
 	t.Run("Offline - No Device Tokens Found", func(t *testing.T) {
 		// Arrange
-		presenceCache := new(mockFetcher[urn.URN, routing.ConnectionInfo])
+		presenceCache := new(mockPresenceCache[urn.URN, routing.ConnectionInfo])
 		deviceTokenFetcher := new(mockFetcher[urn.URN, []routing.DeviceToken])
 		messageStore := new(mockMessageStore)
-		pushNotifier := new(mockPushNotifier) // Not called
+		pushNotifier := new(mockPushNotifier)
 
 		presenceCache.On("Fetch", mock.Anything, testURN).Return(routing.ConnectionInfo{}, errors.New("not found"))
 		messageStore.On("StoreMessages", mock.Anything, testURN, []*transport.SecureEnvelope{testEnvelope}).Return(nil)
@@ -168,7 +194,7 @@ func TestRoutingProcessor(t *testing.T) {
 
 	t.Run("Offline - Message Store Fails", func(t *testing.T) {
 		// Arrange
-		presenceCache := new(mockFetcher[urn.URN, routing.ConnectionInfo])
+		presenceCache := new(mockPresenceCache[urn.URN, routing.ConnectionInfo])
 		messageStore := new(mockMessageStore)
 		expectedErr := "db is down"
 

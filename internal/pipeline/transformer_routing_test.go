@@ -2,7 +2,6 @@ package pipeline_test
 
 import (
 	"context"
-	"encoding/json"
 	"testing"
 	"time"
 
@@ -12,26 +11,24 @@ import (
 	"github.com/illmade-knight/go-secure-messaging/pkg/urn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 func TestEnvelopeTransformer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	t.Cleanup(cancel)
 
-	// REFACTOR: Use the correct, URN-based SecureEnvelope struct.
 	senderURN, err := urn.Parse("urn:sm:user:user-alice")
 	require.NoError(t, err)
 	recipientURN, err := urn.Parse("urn:sm:user:user-bob")
 	require.NoError(t, err)
 
 	validEnvelope := transport.SecureEnvelope{
-		SenderID:              senderURN,
-		RecipientID:           recipientURN,
-		EncryptedData:         []byte("encrypted-payload"),
-		EncryptedSymmetricKey: []byte("encrypted-key"),
-		Signature:             []byte("signature"),
+		SenderID:    senderURN,
+		RecipientID: recipientURN,
 	}
-	validPayload, err := json.Marshal(validEnvelope)
+	// The transformer expects a Protobuf JSON payload.
+	validPayload, err := protojson.Marshal(transport.ToProto(&validEnvelope))
 	require.NoError(t, err, "Setup: failed to marshal valid envelope")
 
 	testCases := []struct {
@@ -50,10 +47,9 @@ func TestEnvelopeTransformer(t *testing.T) {
 					Payload: validPayload,
 				},
 			},
-			expectedEnvelope:      &validEnvelope,
-			expectedSkip:          false,
-			expectError:           false,
-			expectedErrorContains: "",
+			expectedEnvelope: &validEnvelope,
+			expectedSkip:     false,
+			expectError:      false,
 		},
 		{
 			name: "Failure - Malformed JSON Payload",
@@ -76,21 +72,22 @@ func TestEnvelopeTransformer(t *testing.T) {
 					Payload: []byte{},
 				},
 			},
-			expectedEnvelope:      nil,
-			expectedSkip:          true,
-			expectError:           true,
-			expectedErrorContains: "unexpected end of JSON input",
+			expectedEnvelope: nil,
+			expectedSkip:     true,
+			expectError:      true,
+			// CORRECTED: Assert against the actual error from protojson.
+			expectedErrorContains: "proto: syntax error",
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			// Act
-			// REFACTOR: Correctly pass the inputMessage field from the test case struct.
 			actualEnvelope, actualSkip, actualErr := pipeline.EnvelopeTransformer(ctx, tc.inputMessage)
 
 			// Assert
-			assert.Equal(t, tc.expectedEnvelope, actualEnvelope)
+			// Use assert.EqualValues for comparing structs that might have different pointer identities
+			assert.EqualValues(t, tc.expectedEnvelope, actualEnvelope)
 			assert.Equal(t, tc.expectedSkip, actualSkip)
 
 			if tc.expectError {
