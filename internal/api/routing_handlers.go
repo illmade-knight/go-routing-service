@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/illmade-knight/go-microservice-base/pkg/middleware"
@@ -21,6 +22,7 @@ type API struct {
 	producer routing.IngestionProducer
 	store    routing.MessageStore
 	logger   zerolog.Logger
+	wg       sync.WaitGroup
 }
 
 // NewAPI creates a new, stateless API handler.
@@ -30,6 +32,11 @@ func NewAPI(producer routing.IngestionProducer, store routing.MessageStore, logg
 		store:    store,
 		logger:   logger,
 	}
+}
+
+// Wait will block until all background tasks are complete.
+func (a *API) Wait() {
+	a.wg.Wait()
 }
 
 // SendHandler ingests a message, enforces the sender's identity, and publishes it.
@@ -75,7 +82,7 @@ func (a *API) SendHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 }
 
-// GetMessagesHandler retrieves stored messages for the authenticated user.
+// GetMessagesHandler retrieves stored messages for the authenticated user and then deletes them.
 func (a *API) GetMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	userID, ok := middleware.GetUserIDFromContext(r.Context())
 	if !ok {
@@ -101,8 +108,6 @@ func (a *API) GetMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// --- BEGIN RECOMMENDED CHANGE ---
-
 	// 1. Prepare the response payload first.
 	protoEnvelopes := make([]*transport.SecureEnvelopePb, len(idiomaticEnvelopes))
 	messageIDs := make([]string, len(idiomaticEnvelopes))
@@ -127,7 +132,9 @@ func (a *API) GetMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 3. After a successful write, trigger deletion in the background.
+	a.wg.Add(1)
 	go func() {
+		defer a.wg.Done()
 		// Use a background context as the original request may have already timed out.
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -137,6 +144,4 @@ func (a *API) GetMessagesHandler(w http.ResponseWriter, r *http.Request) {
 			logger.Info().Int("count", len(messageIDs)).Msg("Successfully deleted messages after retrieval.")
 		}
 	}()
-
-	// --- END RECOMMENDED CHANGE ---
 }

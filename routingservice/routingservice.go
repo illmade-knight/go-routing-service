@@ -20,6 +20,7 @@ type Wrapper struct {
 	*microservice.BaseServer
 	cfg               *routing.Config
 	processingService *messagepipeline.StreamingService[transport.SecureEnvelope]
+	apiHandler        *api.API
 	logger            zerolog.Logger
 }
 
@@ -68,6 +69,7 @@ func New(
 		BaseServer:        baseServer,
 		cfg:               cfg,
 		processingService: processingService,
+		apiHandler:        apiHandler,
 		logger:            logger,
 	}, nil
 }
@@ -99,6 +101,11 @@ func (w *Wrapper) Shutdown(ctx context.Context) error {
 		w.logger.Error().Err(err).Msg("HTTP server shutdown failed.")
 		finalErr = err
 	}
+
+	// Wait for any in-flight API goroutines (like message deletions) to complete.
+	w.logger.Info().Msg("Waiting for background API tasks to finish...")
+	w.apiHandler.Wait()
+	w.logger.Info().Msg("Background tasks finished.")
 
 	w.logger.Info().Msg("Service shutdown complete.")
 	return finalErr
