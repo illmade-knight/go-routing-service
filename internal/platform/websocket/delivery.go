@@ -5,58 +5,53 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/gorilla/websocket"
-	"github.com/illmade-knight/go-routing-service/internal/realtime"
+	"github.com/illmade-knight/go-dataflow/pkg/messagepipeline"
 	"github.com/illmade-knight/go-secure-messaging/pkg/transport"
-	"github.com/rs/zerolog"
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
-// DeliveryProducer implements the routing.DeliveryProducer interface using WebSockets.
-// It acts as a bridge between the message processing pipeline and the real-time
-// connection manager.
+// DeliveryEventProducer defines the interface for publishing a message to the delivery bus.
+// This allows for a mockable, generic producer.
+type DeliveryEventProducer interface {
+	Publish(ctx context.Context, data messagepipeline.MessageData) (string, error)
+}
+
+// DeliveryProducer implements the routing.DeliveryProducer interface. It now acts as a
+// bridge between the message processing pipeline and the real-time delivery message bus,
+// publishing messages for any interested WebSocket server to consume.
 type DeliveryProducer struct {
-	connManager *realtime.ConnectionManager
-	logger      zerolog.Logger
+	producer DeliveryEventProducer
 }
 
-// NewDeliveryProducer creates a new WebSocket delivery producer.
-func NewDeliveryProducer(connManager *realtime.ConnectionManager, logger zerolog.Logger) *DeliveryProducer {
-	return &DeliveryProducer{
-		connManager: connManager,
-		logger:      logger,
+// NewDeliveryProducer creates a new WebSocket delivery producer that publishes to the bus.
+func NewDeliveryProducer(producer DeliveryEventProducer) *DeliveryProducer {
+	adapter := &DeliveryProducer{
+		producer: producer,
 	}
+	return adapter
 }
 
-// SetConnectionManager allows for setting the ConnectionManager after initialization,
-// which is necessary to resolve a circular dependency in the test setup.
-func (p *DeliveryProducer) SetConnectionManager(connManager *realtime.ConnectionManager) {
-	p.connManager = connManager
-}
-
-// Publish finds the recipient's WebSocket connection and delivers the message.
-func (p *DeliveryProducer) Publish(_ context.Context, _ string, envelope *transport.SecureEnvelope) error {
-	recipientURN := envelope.RecipientID
-	conn, ok := p.connManager.Get(recipientURN)
-	if !ok {
-		p.logger.Warn().Str("recipient", recipientURN.String()).Msg("Attempted to deliver to user, but no active WebSocket connection was found.")
-		return nil
-	}
-
-	// CORRECTED: Convert the native Go envelope to its Protobuf representation first.
+// Publish serializes the envelope and publishes it to the delivery bus.
+// The topicID parameter from the interface is now ignored, as the underlying
+// producer is pre-configured with its specific topic.
+func (p *DeliveryProducer) Publish(ctx context.Context, topicID string, envelope *transport.SecureEnvelope) error {
 	protoEnvelope := transport.ToProto(envelope)
-	// CORRECTED: Serialize using protojson to match the format the client expects.
-	payload, err := protojson.Marshal(protoEnvelope)
+	payloadBytes, err := protojson.Marshal(protoEnvelope)
 	if err != nil {
-		return fmt.Errorf("failed to marshal envelope for websocket delivery: %w", err)
+		return fmt.Errorf("failed to marshal envelope for delivery bus: %w", err)
 	}
 
-	if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
-		p.logger.Error().Err(err).Str("recipient", recipientURN.String()).Msg("Failed to write message to WebSocket. Removing connection.")
-		p.connManager.Remove(recipientURN)
-		return err
+	// Create the MessageData payload expected by the generic go-dataflow producer.
+	// We use the MessageID from the envelope as the unique ID for the data payload.
+	deliveryMessage := messagepipeline.MessageData{
+		ID:      envelope.MessageID,
+		Payload: payloadBytes,
 	}
 
-	p.logger.Info().Str("recipient", recipientURN.String()).Msg("Successfully delivered message via WebSocket.")
+	_, err = p.producer.Publish(ctx, deliveryMessage)
+	if err != nil {
+		return fmt.Errorf("failed to publish message to delivery bus: %w", err)
+	}
+
 	return nil
 }

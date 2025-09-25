@@ -1,0 +1,35 @@
+# Configuration for the Routing Service.
+# These values are embedded in the application binary at build time.
+# Secrets (like JWT_SECRET) must be provided via environment variables.
+
+project_id: gemini-power-test
+run_mode: "local" # Valid options are 'local' or 'production'.
+
+api_port: "8082"
+websocket_port: "8085"
+
+cors:
+  # A list of allowed origins. Use ["*"] for permissive local development.
+  allowed_origins:
+    - http://localhost:4200
+  # The role defines the policy (e.g., allowed methods, headers).
+  # See go-microservice-base middleware for options
+  role: "admin"
+
+presence_cache:
+  # type can be 'inmemory', 'firestore', or 'redis'.
+  type: "inmemory"
+
+  # Settings for the 'redis' type.
+  redis:
+    addr: "localhost:6379"
+
+  # Settings for the 'firestore' type.
+  firestore:
+    collection_name: "presence"
+
+
+# Google Cloud Pub/Sub Topics and Subscriptions.
+ingress_topic_id: "ingress-topic"
+ingress_subscription_id: "ingress-sub"
+delivery_topic_id: "delivery-notifications"
