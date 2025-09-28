@@ -51,7 +51,7 @@ func New(
 	// 4. Get the mux and middleware from the base library.
 	mux := baseServer.Mux()
 	jwtAuth := middleware.NewJWTAuthMiddleware(cfg.JWTSecret)
-	cors := middleware.NewCorsMiddleware(cfg.Cors)
+	cors := middleware.NewCorsMiddleware(cfg.CorsConfig)
 
 	// 5. Register service-specific routes with the centralized middleware.
 	mux.Handle("POST /send", cors(jwtAuth(http.HandlerFunc(apiHandler.SendHandler))))

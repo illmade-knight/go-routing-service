@@ -76,7 +76,7 @@ func TestEnvelopeTransformer(t *testing.T) {
 			expectedSkip:     true,
 			expectError:      true,
 			// CORRECTED: Assert against the actual error from protojson.
-			expectedErrorContains: "proto: syntax error",
+			expectedErrorContains: "failed to unmarshal secure envelope",
 		},
 	}
 

@@ -32,4 +32,6 @@ presence_cache:
 # Google Cloud Pub/Sub Topics and Subscriptions.
 ingress_topic_id: "ingress-topic"
 ingress_subscription_id: "ingress-sub"
+ingress_topic_dlq_id: "ingress-topic-dlq" # ADDED: For poison pill handling
 delivery_topic_id: "delivery-notifications"
+push_notifications_topic_id: "push-notifications"

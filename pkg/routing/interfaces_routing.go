@@ -1,4 +1,4 @@
-// REFACTOR: This new file consolidates all public domain models for the
+// This new file consolidates all public domain models for the
 // routing service into a single location for clarity and maintainability.
 // It also introduces the urn.URN type for all entity identifiers.
 
@@ -9,8 +9,6 @@ package routing
 import (
 	"context"
 
-	// ADDED: Import for the new PresenceCache interface.
-	"github.com/illmade-knight/go-dataflow/pkg/cache"
 	"github.com/illmade-knight/go-secure-messaging/pkg/transport"
 	"github.com/illmade-knight/go-secure-messaging/pkg/urn"
 )
@@ -36,11 +34,4 @@ type MessageStore interface {
 	StoreMessages(ctx context.Context, recipient urn.URN, envelopes []*transport.SecureEnvelope) error
 	RetrieveMessages(ctx context.Context, recipient urn.URN) ([]*transport.SecureEnvelope, error)
 	DeleteMessages(ctx context.Context, recipient urn.URN, messageIDs []string) error
-}
-
-// REFACTOR: Add a new, dedicated PresenceCache interface for clarity.
-// This makes it explicit that presence is a write-heavy operation, distinct
-// from the read-through Fetcher pattern.
-type PresenceCache interface {
-	cache.PresenceCache[urn.URN, ConnectionInfo]
 }

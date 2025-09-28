@@ -15,7 +15,7 @@ type Config struct {
 	IngressTopicID        string
 	NumPipelineWorkers    int
 	JWTSecret             string `env:"JWT_SECRET,required"`
-	Cors                  middleware.CorsConfig
+	CorsConfig            middleware.CorsConfig
 }
 
 // Dependencies holds all the external services the routing service needs to operate.

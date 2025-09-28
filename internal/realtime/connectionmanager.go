@@ -157,7 +157,7 @@ func (cm *ConnectionManager) Remove(userURN urn.URN) {
 
 // deliveryProcessor is the StreamProcessor for the internal delivery pipeline.
 // It checks if the recipient is connected to this specific server instance and delivers the message.
-func (cm *ConnectionManager) deliveryProcessor(ctx context.Context, original messagepipeline.Message, envelope *transport.SecureEnvelope) error {
+func (cm *ConnectionManager) deliveryProcessor(_ context.Context, _ messagepipeline.Message, envelope *transport.SecureEnvelope) error {
 	recipientURN := envelope.RecipientID
 	conn, ok := cm.Get(recipientURN)
 	if !ok {
@@ -202,7 +202,12 @@ func (cm *ConnectionManager) connectHandler(w http.ResponseWriter, r *http.Reque
 		cm.logger.Error().Err(err).Msg("Failed to upgrade connection.")
 		return
 	}
-	defer conn.Close()
+	defer func() {
+		err = conn.Close()
+		if err != nil {
+			cm.logger.Warn().Err(err).Msg("error closing connection")
+		}
+	}()
 
 	cm.add(userURN, conn)
 	defer cm.Remove(userURN)

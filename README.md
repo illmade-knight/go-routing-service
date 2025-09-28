@@ -5,44 +5,56 @@
 
 The **go-routing-service** is a high-performance, secure, and scalable microservice responsible for real-time and asynchronous delivery of messages. It intelligently routes messages to online users via WebSockets and provides transient, Firestore-backed storage for offline users.
 
-### ### Architecture
+### **Architecture**
 
-The service is built on a standardized `go-microservice-base` library and features a robust, scalable architecture.
+The service is built on a `go-microservice-base` library and features a robust, scalable architecture composed of two primary services that can be scaled independently.
 
-#### **Dual Server Model**
-The service runs two independent servers to cleanly separate concerns:
-* **Stateless API Server**: A standard HTTP server for message ingestion (`/send`), retrieval of offline messages (`/messages`), and observability endpoints (`/healthz`, `/metrics`).
-* **Stateful WebSocket Server**: A dedicated server that manages persistent WebSocket connections, tracks real-time user presence, and handles direct message delivery.
+* **Stateless API & Processing Service**: A standard HTTP server for message ingestion (`/send`), retrieval of offline messages (`/messages`), and observability. This service also runs the core background pipeline that processes all incoming messages.
+* **Stateful WebSocket Service**: A dedicated server that manages persistent WebSocket connections, tracks real-time user presence in a shared cache (e.g., Redis, Firestore), and handles direct message delivery.
 
-#### **Scalable Real-Time Delivery**
-To support high availability and horizontal scaling, the WebSocket servers are decoupled from the main processing pipeline via a **Pub/Sub "Delivery Bus"**. When a message needs to be delivered in real-time, it's published to a broadcast topic. Each WebSocket server instance consumes from this topic and delivers the message only if it is managing that specific user's connection.
+These services are decoupled via Google Cloud Pub/Sub, enabling high availability and horizontal scaling.
 
-### ### Key Features
-* **Dual Server Architecture**: Cleanly separates stateless API and stateful WebSocket logic.
-* **Horizontally Scalable WebSocket Layer**: Uses a Pub/Sub "Delivery Bus" for high-availability, multi-instance deployments.
-* **Real-time & Transient Offline Delivery**: Implements both WebSocket delivery and Firestore-backed storage for offline messages.
-* **Declarative Configuration**: Uses an embedded `config.yaml` for non-secret configuration and environment variables for secrets, providing secure and consistent deployments.
-* **Selectable Backends**: The `PresenceCache` can be configured to use Redis, Firestore, or an in-memory store to fit different deployment needs.
+
+### **Key Features**
+
+* **Dual-Service Architecture**: Cleanly separates stateless API/processing logic from stateful WebSocket management for independent scaling.
+* **Horizontally Scalable**: Uses a Pub/Sub "Delivery Bus" and a shared Presence Cache for high-availability, multi-instance deployments.
+* **Real-time & Offline Delivery**: Implements both WebSocket delivery for online users and Firestore-backed storage for offline users.
+* **Configuration-Driven**: A single entrypoint uses an embedded `config.yaml` and environment variables to wire up dependencies for different environments.
+* **Selectable Backends**: The `PresenceCache` can be configured to use Redis, Firestore, or an in-memory store.
 * **Secure & Standardized**: Hardened against sender spoofing and uses centralized JWT authentication and configurable CORS policies.
 
-### ### Configuration
-The service is configured through two primary sources:
-1.  **`cmd/runroutingservice/config.yaml`**: This embedded file contains non-secret configuration like port numbers, topic names, and backend choices.
-2.  **Environment Variables**: Secrets, primarily `JWT_SECRET`, must be provided via the environment.
+### **Configuration**
 
-The `RUN_MODE` variable in `config.yaml` controls the wiring of internal components:
-* `local`: The real-time delivery bus runs in-memory for simple, single-instance local testing against real cloud dependencies.
-* `production`: The real-time delivery bus uses GCP Pub/Sub for multi-instance scalability.
+The service is configured via `config.yaml` for non-secret values and environment variables for secrets. The `run_mode` in the config file is critical:
 
-### ### Running the Service
-For all runs, ensure you are authenticated to Google Cloud (e.g., `gcloud auth application-default login`).
+* `run_mode: "local"`: The service starts with **in-memory fakes** for all external dependencies (Pub/Sub, Firestore, etc.). This is ideal for fast, local development without any cloud connectivity.
+* `run_mode: "production"`: The service starts with **real clients** for all dependencies (GCP Pub/Sub, Firestore, etc.) and is ready to serve production traffic.
 
-1.  **Configure `config.yaml`**: Set your `project_id` and other desired values.
+### **Running the Service**
+
+1.  **Configure `config.yaml`**: Set your `project_id` and other desired values in `cmd/runroutingservice/prod/config.yaml`.
 2.  **Set Environment Variables**:
     ```shell
     export JWT_SECRET="a-very-secure-secret-key"
     ```
 3.  **Run the Service**:
     ```shell
+    # For production mode (requires gcloud auth)
     go run ./cmd/runroutingservice
+
+    # To run in local mode, edit config.yaml to set run_mode: "local"
+    ```
+
+### **Testing**
+
+The project contains a comprehensive test suite.
+
+* **Run Unit Tests**:
+    ```shell
+    go test ./...
+    ```
+* **Run Integration & E2E Tests**: These tests require Docker to run emulators for GCP services.
+    ```shell
+    go test -tags=integration ./...
     ```

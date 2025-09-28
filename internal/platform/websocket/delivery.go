@@ -34,7 +34,7 @@ func NewDeliveryProducer(producer DeliveryEventProducer) *DeliveryProducer {
 // Publish serializes the envelope and publishes it to the delivery bus.
 // The topicID parameter from the interface is now ignored, as the underlying
 // producer is pre-configured with its specific topic.
-func (p *DeliveryProducer) Publish(ctx context.Context, topicID string, envelope *transport.SecureEnvelope) error {
+func (p *DeliveryProducer) Publish(ctx context.Context, _ string, envelope *transport.SecureEnvelope) error {
 	protoEnvelope := transport.ToProto(envelope)
 	payloadBytes, err := protojson.Marshal(protoEnvelope)
 	if err != nil {

@@ -52,33 +52,23 @@ func (m *mockMessageStore) DeleteMessages(ctx context.Context, r urn.URN, ids []
 // --- Tests ---
 
 func TestSendHandler(t *testing.T) {
-	authedUserURN, err := urn.Parse("urn:sm:user:user-alice") // The real authenticated user
-	require.NoError(t, err)
-
-	recipientURN, err := urn.Parse("urn:sm:user:user-bob")
-	require.NoError(t, err)
-
-	// This envelope has a FAKE sender. We will test that it gets overwritten.
-	spoofedSenderURN, err := urn.Parse("urn:sm:user:user-eve")
-	require.NoError(t, err)
+	authedUserURN, _ := urn.Parse("urn:sm:user:user-alice")
+	recipientURN, _ := urn.Parse("urn:sm:user:user-bob")
+	spoofedSenderURN, _ := urn.Parse("urn:sm:user:user-eve")
 
 	envelopeWithSpoofedSender := transport.SecureEnvelope{
 		SenderID:    spoofedSenderURN,
 		RecipientID: recipientURN,
 	}
-
-	// Correctly marshal the idiomatic struct to its Protobuf representation first
 	envelopeProto := transport.ToProto(&envelopeWithSpoofedSender)
-	bodyBytes, err := protojson.Marshal(envelopeProto)
+	validBodyBytes, err := protojson.Marshal(envelopeProto)
 	require.NoError(t, err)
 
 	t.Run("Success and SenderID is overwritten", func(t *testing.T) {
 		// Arrange
 		producer := new(mockIngestionProducer)
-		store := new(mockMessageStore)
-		apiHandler := api.NewAPI(producer, store, zerolog.Nop())
+		apiHandler := api.NewAPI(producer, nil, zerolog.Nop())
 
-		// We use a capture to inspect the argument passed to Publish.
 		var capturedEnvelope *transport.SecureEnvelope
 		producer.On("Publish", mock.Anything, mock.AnythingOfType("*transport.SecureEnvelope")).
 			Run(func(args mock.Arguments) {
@@ -86,8 +76,7 @@ func TestSendHandler(t *testing.T) {
 			}).
 			Return(nil)
 
-		req := httptest.NewRequest(http.MethodPost, "/send", bytes.NewReader(bodyBytes))
-		// Simulate authentication for "user-alice"
+		req := httptest.NewRequest(http.MethodPost, "/send", bytes.NewReader(validBodyBytes))
 		ctx := middleware.ContextWithUserID(context.Background(), authedUserURN.EntityID())
 		req = req.WithContext(ctx)
 		rr := httptest.NewRecorder()
@@ -98,18 +87,57 @@ func TestSendHandler(t *testing.T) {
 		// Assert
 		assert.Equal(t, http.StatusAccepted, rr.Code)
 		producer.AssertExpectations(t)
-		require.NotNil(t, capturedEnvelope, "Producer.Publish was not called")
-
-		// CRITICAL: Assert that the SenderID was overwritten with the authenticated user's ID.
-		assert.Equal(t, authedUserURN, capturedEnvelope.SenderID, "SenderID should be overwritten with the ID from the JWT")
+		require.NotNil(t, capturedEnvelope)
+		assert.Equal(t, authedUserURN, capturedEnvelope.SenderID, "SenderID should be overwritten")
 		assert.Equal(t, recipientURN, capturedEnvelope.RecipientID, "RecipientID should be preserved")
+	})
+
+	t.Run("Failure - Malformed JSON body", func(t *testing.T) {
+		// Arrange
+		producer := new(mockIngestionProducer)
+		apiHandler := api.NewAPI(producer, nil, zerolog.Nop())
+
+		invalidJSON := []byte(`{"recipientId": "urn:sm:user:user-bob",`) // Malformed JSON
+		req := httptest.NewRequest(http.MethodPost, "/send", bytes.NewReader(invalidJSON))
+		ctx := middleware.ContextWithUserID(context.Background(), authedUserURN.EntityID())
+		req = req.WithContext(ctx)
+		rr := httptest.NewRecorder()
+
+		// Act
+		apiHandler.SendHandler(rr, req)
+
+		// Assert
+		assert.Equal(t, http.StatusBadRequest, rr.Code)
+		var errResp response.APIError
+		err := json.Unmarshal(rr.Body.Bytes(), &errResp)
+		require.NoError(t, err)
+		assert.Contains(t, errResp.Error, "Invalid request body")
+		producer.AssertNotCalled(t, "Publish", mock.Anything, mock.Anything)
+	})
+
+	t.Run("Failure - Producer fails to publish", func(t *testing.T) {
+		// Arrange
+		producer := new(mockIngestionProducer)
+		apiHandler := api.NewAPI(producer, nil, zerolog.Nop())
+
+		producer.On("Publish", mock.Anything, mock.AnythingOfType("*transport.SecureEnvelope")).Return(assert.AnError)
+
+		req := httptest.NewRequest(http.MethodPost, "/send", bytes.NewReader(validBodyBytes))
+		ctx := middleware.ContextWithUserID(context.Background(), authedUserURN.EntityID())
+		req = req.WithContext(ctx)
+		rr := httptest.NewRecorder()
+
+		// Act
+		apiHandler.SendHandler(rr, req)
+
+		// Assert
+		assert.Equal(t, http.StatusInternalServerError, rr.Code)
+		producer.AssertExpectations(t)
 	})
 }
 
 func TestGetMessagesHandler(t *testing.T) {
-	authedUserURN, err := urn.Parse("urn:sm:user:user-bob")
-	require.NoError(t, err)
-
+	authedUserURN, _ := urn.Parse("urn:sm:user:user-bob")
 	testMessages := []*transport.SecureEnvelope{
 		{MessageID: "msg-1", RecipientID: authedUserURN},
 		{MessageID: "msg-2", RecipientID: authedUserURN},
@@ -118,16 +146,10 @@ func TestGetMessagesHandler(t *testing.T) {
 	t.Run("Success - Messages Found", func(t *testing.T) {
 		// Arrange
 		store := new(mockMessageStore)
-		producer := new(mockIngestionProducer)
-		apiHandler := api.NewAPI(producer, store, zerolog.Nop())
-
+		apiHandler := api.NewAPI(nil, store, zerolog.Nop())
 		store.On("RetrieveMessages", mock.Anything, authedUserURN).Return(testMessages, nil)
-		// Note: The actual implementation deletes messages in a goroutine,
-		// so we don't test the delete call in this unit test. That is better
-		// suited for an E2E test.
 
 		req := httptest.NewRequest(http.MethodGet, "/messages", nil)
-		// Simulate authentication
 		ctx := middleware.ContextWithUserID(context.Background(), authedUserURN.EntityID())
 		req = req.WithContext(ctx)
 		rr := httptest.NewRecorder()
@@ -138,9 +160,8 @@ func TestGetMessagesHandler(t *testing.T) {
 		// Assert
 		assert.Equal(t, http.StatusOK, rr.Code)
 		store.AssertExpectations(t)
-
 		var responseList transport.SecureEnvelopeListPb
-		err = protojson.Unmarshal(rr.Body.Bytes(), &responseList)
+		err := protojson.Unmarshal(rr.Body.Bytes(), &responseList)
 		require.NoError(t, err)
 		assert.Len(t, responseList.Envelopes, 2)
 	})
@@ -148,9 +169,7 @@ func TestGetMessagesHandler(t *testing.T) {
 	t.Run("Success - No Messages Found", func(t *testing.T) {
 		// Arrange
 		store := new(mockMessageStore)
-		producer := new(mockIngestionProducer)
-		apiHandler := api.NewAPI(producer, store, zerolog.Nop())
-
+		apiHandler := api.NewAPI(nil, store, zerolog.Nop())
 		store.On("RetrieveMessages", mock.Anything, authedUserURN).Return([]*transport.SecureEnvelope{}, nil)
 
 		req := httptest.NewRequest(http.MethodGet, "/messages", nil)
@@ -169,9 +188,7 @@ func TestGetMessagesHandler(t *testing.T) {
 	t.Run("Failure - Store fails", func(t *testing.T) {
 		// Arrange
 		store := new(mockMessageStore)
-		producer := new(mockIngestionProducer)
-		apiHandler := api.NewAPI(producer, store, zerolog.Nop())
-
+		apiHandler := api.NewAPI(nil, store, zerolog.Nop())
 		store.On("RetrieveMessages", mock.Anything, authedUserURN).Return(nil, assert.AnError)
 
 		req := httptest.NewRequest(http.MethodGet, "/messages", nil)
@@ -187,8 +204,6 @@ func TestGetMessagesHandler(t *testing.T) {
 		var errResp response.APIError
 		err := json.Unmarshal(rr.Body.Bytes(), &errResp)
 		require.NoError(t, err)
-
-		// THE FIX: Assert against the actual error message returned by the API.
 		assert.Equal(t, "Internal server error", errResp.Error)
 		store.AssertExpectations(t)
 	})

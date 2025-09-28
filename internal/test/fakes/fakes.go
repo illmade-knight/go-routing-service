@@ -15,7 +15,7 @@ import (
 )
 
 // --- Consumer ---
-// No changes in this section.
+
 type InMemoryConsumer struct {
 	outputChan chan messagepipeline.Message
 	logger     zerolog.Logger
@@ -37,8 +37,8 @@ func (c *InMemoryConsumer) Publish(msg messagepipeline.Message) {
 	}
 }
 func (c *InMemoryConsumer) Messages() <-chan messagepipeline.Message { return c.outputChan }
-func (c *InMemoryConsumer) Start(ctx context.Context) error          { return nil }
-func (c *InMemoryConsumer) Stop(ctx context.Context) error {
+func (c *InMemoryConsumer) Start(_ context.Context) error            { return nil }
+func (c *InMemoryConsumer) Stop(_ context.Context) error {
 	c.stopOnce.Do(func() {
 		close(c.doneChan)
 		close(c.outputChan)
@@ -49,13 +49,11 @@ func (c *InMemoryConsumer) Done() <-chan struct{} { return c.doneChan }
 
 // --- Producer ---
 
-// REFACTOR: Renamed struct back to Producer to avoid confusion.
 type Producer struct {
 	logger        zerolog.Logger
 	publishedChan chan messagepipeline.MessageData
 }
 
-// REFACTOR: Renamed constructor back to NewProducer.
 func NewProducer(logger zerolog.Logger) *Producer {
 	return &Producer{
 		logger:        logger,
@@ -64,27 +62,27 @@ func NewProducer(logger zerolog.Logger) *Producer {
 }
 func (p *Producer) Published() <-chan messagepipeline.MessageData { return p.publishedChan }
 
-// REFACTOR: Renamed method from PublishEvent back to Publish to match the DeliveryEventProducer interface.
-func (p *Producer) Publish(ctx context.Context, data messagepipeline.MessageData) (string, error) {
+// Publish to match the DeliveryEventProducer interface.
+func (p *Producer) Publish(_ context.Context, data messagepipeline.MessageData) (string, error) {
 	p.logger.Info().Str("id", data.ID).Msg("[FAKES-PRODUCER] Publish called.")
 	p.publishedChan <- data
 	return data.ID, nil
 }
-func (p *Producer) Stop(ctx context.Context) error { close(p.publishedChan); return nil }
+func (p *Producer) Stop(_ context.Context) error { close(p.publishedChan); return nil }
 
 // --- Persistence & Notifications ---
-// No changes in this section.
+
 type PushNotifier struct{ logger zerolog.Logger }
 
 func NewPushNotifier(logger zerolog.Logger) *PushNotifier { return &PushNotifier{logger: logger} }
-func (m *PushNotifier) Notify(ctx context.Context, tokens []routing.DeviceToken, envelope *transport.SecureEnvelope) error {
+func (m *PushNotifier) Notify(_ context.Context, _ []routing.DeviceToken, _ *transport.SecureEnvelope) error {
 	return nil
 }
 
 type TokenFetcher struct{}
 
 func NewTokenFetcher() *TokenFetcher { return &TokenFetcher{} }
-func (m *TokenFetcher) Fetch(ctx context.Context, key urn.URN) ([]routing.DeviceToken, error) {
+func (m *TokenFetcher) Fetch(_ context.Context, _ urn.URN) ([]routing.DeviceToken, error) {
 	return nil, nil
 }
 func (m *TokenFetcher) Close() error { return nil }
@@ -92,10 +90,10 @@ func (m *TokenFetcher) Close() error { return nil }
 type MessageStore struct{ logger zerolog.Logger }
 
 func NewMessageStore(logger zerolog.Logger) *MessageStore { return &MessageStore{logger: logger} }
-func (m *MessageStore) StoreMessages(ctx context.Context, r urn.URN, e []*transport.SecureEnvelope) error {
+func (m *MessageStore) StoreMessages(_ context.Context, _ urn.URN, _ []*transport.SecureEnvelope) error {
 	return nil
 }
-func (m *MessageStore) RetrieveMessages(ctx context.Context, r urn.URN) ([]*transport.SecureEnvelope, error) {
+func (m *MessageStore) RetrieveMessages(_ context.Context, _ urn.URN) ([]*transport.SecureEnvelope, error) {
 	return nil, nil
 }
-func (m *MessageStore) DeleteMessages(ctx context.Context, r urn.URN, ids []string) error { return nil }
+func (m *MessageStore) DeleteMessages(_ context.Context, _ urn.URN, _ []string) error { return nil }
