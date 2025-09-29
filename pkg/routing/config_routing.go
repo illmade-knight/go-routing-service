@@ -13,6 +13,7 @@ type Config struct {
 	WebSocketListenAddr   string
 	IngressSubscriptionID string
 	IngressTopicID        string
+	DeliveryTopicID       string // ADDED
 	NumPipelineWorkers    int
 	JWTSecret             string `env:"JWT_SECRET,required"`
 	CorsConfig            middleware.CorsConfig

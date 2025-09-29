@@ -27,6 +27,14 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
+// NOTE: This mockPushNotifier is intentionally simple for this test, as we
+// are asserting that it is NOT called.
+type onlinePathMockPushNotifier struct{}
+
+func (m *onlinePathMockPushNotifier) Notify(context.Context, []routing.DeviceToken, *transport.SecureEnvelope) error {
+	return nil // Does nothing
+}
+
 func TestPipeline_OnlineDelivery_Integration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	t.Cleanup(cancel)
@@ -49,14 +57,12 @@ func TestPipeline_OnlineDelivery_Integration(t *testing.T) {
 	senderURN, _ := urn.Parse("urn:sm:user:online-sender")
 	recipientURN, _ := urn.Parse("urn:sm:user:online-recipient")
 
-	// Use a real Firestore-backed presence cache
 	presenceCache, err := cache.NewFirestorePresenceCache[urn.URN, routing.ConnectionInfo](
 		fsClient,
 		"presence-test-"+runID,
 	)
 	require.NoError(t, err)
 
-	// Create a real producer that will publish to the delivery topic
 	deliveryTopicID := "delivery-topic-" + runID
 	dataflowProducer, err := messagepipeline.NewGooglePubsubProducer(
 		messagepipeline.NewGooglePubsubProducerDefaults(deliveryTopicID), psClient, logger,
@@ -70,7 +76,7 @@ func TestPipeline_OnlineDelivery_Integration(t *testing.T) {
 	deps := &routing.Dependencies{
 		PresenceCache:      presenceCache,
 		DeviceTokenFetcher: &mockTokenFetcher{}, // Fails to ensure presence is the only online path
-		PushNotifier:       &mockPushNotifier{}, // Does nothing
+		PushNotifier:       &onlinePathMockPushNotifier{},
 		MessageStore:       messageStore,
 		DeliveryProducer:   deliveryProducer,
 	}
@@ -78,7 +84,7 @@ func TestPipeline_OnlineDelivery_Integration(t *testing.T) {
 	// 3. Create Pub/Sub resources for both ingress and delivery topics
 	ingressTopicID := "ingress-topic-" + runID
 	ingressSubID := "ingress-sub-" + runID
-	deliverySubID := "delivery-sub-" + runID // Subscription to listen for the output
+	deliverySubID := "delivery-sub-" + runID
 	createPubsubResources(t, ctx, psClient, projectID, ingressTopicID, ingressSubID)
 	createPubsubResources(t, ctx, psClient, projectID, deliveryTopicID, deliverySubID)
 
@@ -88,7 +94,9 @@ func TestPipeline_OnlineDelivery_Integration(t *testing.T) {
 	require.NoError(t, err)
 
 	// 4. Assemble and start the pipeline
-	pipelineService, err := pipeline.NewService(pipeline.Config{NumWorkers: 1}, deps, consumer, logger)
+	// CORRECTED: Pass the new, required routing.Config to the service constructor.
+	routingCfg := &routing.Config{DeliveryTopicID: deliveryTopicID}
+	pipelineService, err := pipeline.NewService(pipeline.Config{NumWorkers: 1}, deps, routingCfg, consumer, logger)
 	require.NoError(t, err)
 
 	pipelineCtx, cancelPipeline := context.WithCancel(ctx)
@@ -128,7 +136,7 @@ func TestPipeline_OnlineDelivery_Integration(t *testing.T) {
 		err = deliverySub.Receive(cctx, func(ctx context.Context, msg *pubsub.Message) {
 			msg.Ack()
 			receivedMsg = msg
-			cancel() // Stop receiving after one message
+			cancel()
 		})
 		assert.NoError(t, err, "Receive should not return a non-timeout error")
 	}()
@@ -137,7 +145,6 @@ func TestPipeline_OnlineDelivery_Integration(t *testing.T) {
 	require.NotNil(t, receivedMsg, "Did not receive message on the delivery topic")
 	t.Log("✅ Message correctly received on the delivery topic.")
 
-	// Unmarshal and verify the payload
 	var receivedData messagepipeline.MessageData
 	err = json.Unmarshal(receivedMsg.Data, &receivedData)
 	require.NoError(t, err)
@@ -150,7 +157,7 @@ func TestPipeline_OnlineDelivery_Integration(t *testing.T) {
 	assert.Equal(t, originalEnvelope.EncryptedData, receivedEnvelope.EncryptedData)
 
 	// 8. NEGATIVE ASSERTION: Verify the message was NOT stored in Firestore
-	time.Sleep(500 * time.Millisecond) // Give a moment for any incorrect processing to occur
+	time.Sleep(500 * time.Millisecond)
 	docs, err := fsClient.Collection("user-messages").Doc(recipientURN.String()).Collection("messages").Documents(ctx).GetAll()
 	require.NoError(t, err)
 	assert.Empty(t, docs, "Message should NOT have been stored in Firestore for an online user")

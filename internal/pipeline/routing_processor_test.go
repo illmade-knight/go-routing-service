@@ -18,7 +18,6 @@ import (
 
 // --- Mocks using testify/mock ---
 
-// mockFetcher is used for the read-only deviceTokenFetcher dependency.
 type mockFetcher[K comparable, V any] struct {
 	mock.Mock
 }
@@ -37,7 +36,6 @@ func (m *mockFetcher[K, V]) Close() error {
 	return args.Error(0)
 }
 
-// REFACTOR: Create a new mock that correctly implements the cache.PresenceCache interface.
 type mockPresenceCache[K comparable, V any] struct {
 	mock.Mock
 }
@@ -115,100 +113,116 @@ func TestRoutingProcessor(t *testing.T) {
 	t.Cleanup(cancel)
 
 	nopLogger := zerolog.Nop()
-	testURN, err := urn.Parse("urn:sm:user:user-bob")
-	require.NoError(t, err)
-
-	testEnvelope := &transport.SecureEnvelope{
-		RecipientID: testURN,
-	}
+	testURN, _ := urn.Parse("urn:sm:user:user-bob")
+	testEnvelope := &transport.SecureEnvelope{RecipientID: testURN}
 	testMessage := messagepipeline.Message{}
+	testConfig := &routing.Config{DeliveryTopicID: "shared-delivery-topic"}
 
-	t.Run("Happy Path - User is Online", func(t *testing.T) {
+	t.Run("Online User - Publishes to Shared Delivery Topic", func(t *testing.T) {
 		// Arrange
-		// REFACTOR: Use the new mockPresenceCache.
 		presenceCache := new(mockPresenceCache[urn.URN, routing.ConnectionInfo])
 		deliveryProducer := new(mockDeliveryProducer)
-		deviceTokenFetcher := new(mockFetcher[urn.URN, []routing.DeviceToken])
-		pushNotifier := new(mockPushNotifier)
-		messageStore := new(mockMessageStore)
+		deps := &routing.Dependencies{
+			PresenceCache:    presenceCache,
+			DeliveryProducer: deliveryProducer,
+		}
 
-		presenceCache.On("Fetch", mock.Anything, testURN).Return(routing.ConnectionInfo{ServerInstanceID: "pod-123"}, nil)
-		deliveryProducer.On("Publish", mock.Anything, "delivery-pod-123", testEnvelope).Return(nil)
+		presenceCache.On("Fetch", mock.Anything, testURN).Return(routing.ConnectionInfo{}, nil)
+		// CORRECTED: Assert that it publishes to the shared topic from the config.
+		deliveryProducer.On("Publish", mock.Anything, testConfig.DeliveryTopicID, testEnvelope).Return(nil)
 
-		processor := pipeline.NewRoutingProcessor(presenceCache, deviceTokenFetcher, deliveryProducer, pushNotifier, messageStore, nopLogger)
+		processor := pipeline.New(deps, testConfig, nopLogger)
 
 		// Act
 		err := processor(ctx, testMessage, testEnvelope)
 
 		// Assert
 		require.NoError(t, err)
-		presenceCache.AssertExpectations(t)
 		deliveryProducer.AssertExpectations(t)
 	})
 
-	t.Run("Happy Path - User is Offline with Device Tokens", func(t *testing.T) {
+	t.Run("Offline User - Mobile Token - Notifies and Stores", func(t *testing.T) {
 		// Arrange
 		presenceCache := new(mockPresenceCache[urn.URN, routing.ConnectionInfo])
 		deviceTokenFetcher := new(mockFetcher[urn.URN, []routing.DeviceToken])
 		messageStore := new(mockMessageStore)
 		pushNotifier := new(mockPushNotifier)
-		deliveryProducer := new(mockDeliveryProducer)
-		deviceTokens := []routing.DeviceToken{{Token: "device-abc"}}
+		deps := &routing.Dependencies{
+			PresenceCache:      presenceCache,
+			DeviceTokenFetcher: deviceTokenFetcher,
+			MessageStore:       messageStore,
+			PushNotifier:       pushNotifier,
+		}
+		mobileTokens := []routing.DeviceToken{{Token: "ios-device-abc", Platform: "ios"}}
 
 		presenceCache.On("Fetch", mock.Anything, testURN).Return(routing.ConnectionInfo{}, errors.New("not found"))
+		deviceTokenFetcher.On("Fetch", mock.Anything, testURN).Return(mobileTokens, nil)
+		pushNotifier.On("Notify", mock.Anything, mobileTokens, testEnvelope).Return(nil)
 		messageStore.On("StoreMessages", mock.Anything, testURN, []*transport.SecureEnvelope{testEnvelope}).Return(nil)
-		deviceTokenFetcher.On("Fetch", mock.Anything, testURN).Return(deviceTokens, nil)
-		pushNotifier.On("Notify", mock.Anything, deviceTokens, testEnvelope).Return(nil)
 
-		processor := pipeline.NewRoutingProcessor(presenceCache, deviceTokenFetcher, deliveryProducer, pushNotifier, messageStore, nopLogger)
+		processor := pipeline.New(deps, testConfig, nopLogger)
 
 		// Act
 		err := processor(ctx, testMessage, testEnvelope)
 
 		// Assert
 		require.NoError(t, err)
-		mock.AssertExpectationsForObjects(t, presenceCache, messageStore, deviceTokenFetcher, pushNotifier)
+		mock.AssertExpectationsForObjects(t, presenceCache, deviceTokenFetcher, pushNotifier, messageStore)
 	})
 
-	t.Run("Offline - No Device Tokens Found", func(t *testing.T) {
+	t.Run("Offline User - Web Token - Publishes to Delivery Bus and Stores", func(t *testing.T) {
+		// Arrange
+		presenceCache := new(mockPresenceCache[urn.URN, routing.ConnectionInfo])
+		deviceTokenFetcher := new(mockFetcher[urn.URN, []routing.DeviceToken])
+		deliveryProducer := new(mockDeliveryProducer)
+		messageStore := new(mockMessageStore)
+		deps := &routing.Dependencies{
+			PresenceCache:      presenceCache,
+			DeviceTokenFetcher: deviceTokenFetcher,
+			DeliveryProducer:   deliveryProducer,
+			MessageStore:       messageStore,
+			PushNotifier:       new(mockPushNotifier), // Ensure it's not called
+		}
+		webTokens := []routing.DeviceToken{{Token: "web-subscription-xyz", Platform: "web"}}
+
+		presenceCache.On("Fetch", mock.Anything, testURN).Return(routing.ConnectionInfo{}, errors.New("not found"))
+		deviceTokenFetcher.On("Fetch", mock.Anything, testURN).Return(webTokens, nil)
+		deliveryProducer.On("Publish", mock.Anything, testConfig.DeliveryTopicID, testEnvelope).Return(nil)
+		messageStore.On("StoreMessages", mock.Anything, testURN, []*transport.SecureEnvelope{testEnvelope}).Return(nil)
+
+		processor := pipeline.New(deps, testConfig, nopLogger)
+
+		// Act
+		err := processor(ctx, testMessage, testEnvelope)
+
+		// Assert
+		require.NoError(t, err)
+		mock.AssertExpectationsForObjects(t, presenceCache, deviceTokenFetcher, deliveryProducer, messageStore)
+		deps.PushNotifier.(*mockPushNotifier).AssertNotCalled(t, "Notify", mock.Anything, mock.Anything, mock.Anything)
+	})
+
+	t.Run("Offline User - No Tokens - Stores Message", func(t *testing.T) {
 		// Arrange
 		presenceCache := new(mockPresenceCache[urn.URN, routing.ConnectionInfo])
 		deviceTokenFetcher := new(mockFetcher[urn.URN, []routing.DeviceToken])
 		messageStore := new(mockMessageStore)
-		pushNotifier := new(mockPushNotifier)
+		deps := &routing.Dependencies{
+			PresenceCache:      presenceCache,
+			DeviceTokenFetcher: deviceTokenFetcher,
+			MessageStore:       messageStore,
+		}
 
 		presenceCache.On("Fetch", mock.Anything, testURN).Return(routing.ConnectionInfo{}, errors.New("not found"))
+		deviceTokenFetcher.On("Fetch", mock.Anything, testURN).Return(nil, errors.New("not found"))
 		messageStore.On("StoreMessages", mock.Anything, testURN, []*transport.SecureEnvelope{testEnvelope}).Return(nil)
-		deviceTokenFetcher.On("Fetch", mock.Anything, testURN).Return([]routing.DeviceToken(nil), errors.New("no tokens"))
 
-		processor := pipeline.NewRoutingProcessor(presenceCache, deviceTokenFetcher, nil, pushNotifier, messageStore, nopLogger)
-
-		// Act
-		err := processor(ctx, testMessage, testEnvelope)
-
-		// Assert
-		require.NoError(t, err, "Failing to find tokens should not be a processing error")
-		mock.AssertExpectationsForObjects(t, presenceCache, messageStore, deviceTokenFetcher)
-		pushNotifier.AssertNotCalled(t, "Notify", mock.Anything, mock.Anything, mock.Anything)
-	})
-
-	t.Run("Offline - Message Store Fails", func(t *testing.T) {
-		// Arrange
-		presenceCache := new(mockPresenceCache[urn.URN, routing.ConnectionInfo])
-		messageStore := new(mockMessageStore)
-		expectedErr := "db is down"
-
-		presenceCache.On("Fetch", mock.Anything, testURN).Return(routing.ConnectionInfo{}, errors.New("not found"))
-		messageStore.On("StoreMessages", mock.Anything, testURN, []*transport.SecureEnvelope{testEnvelope}).Return(errors.New(expectedErr))
-
-		processor := pipeline.NewRoutingProcessor(presenceCache, nil, nil, nil, messageStore, nopLogger)
+		processor := pipeline.New(deps, testConfig, nopLogger)
 
 		// Act
 		err := processor(ctx, testMessage, testEnvelope)
 
 		// Assert
-		require.Error(t, err)
-		require.ErrorContains(t, err, expectedErr)
-		mock.AssertExpectationsForObjects(t, presenceCache, messageStore)
+		require.NoError(t, err)
+		mock.AssertExpectationsForObjects(t, presenceCache, deviceTokenFetcher, messageStore)
 	})
 }

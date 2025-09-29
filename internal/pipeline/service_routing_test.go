@@ -6,8 +6,8 @@ import (
 	"time"
 
 	"github.com/illmade-knight/go-dataflow/pkg/messagepipeline"
-	"github.com/illmade-knight/go-routing-service/internal/pipeline" // Updated import
-	"github.com/illmade-knight/go-routing-service/pkg/routing"       // Updated import
+	"github.com/illmade-knight/go-routing-service/internal/pipeline"
+	"github.com/illmade-knight/go-routing-service/pkg/routing"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -25,9 +25,11 @@ func newMockMessageConsumer() *mockMessageConsumer {
 		messageChannel: make(chan messagepipeline.Message),
 	}
 }
-func (m *mockMessageConsumer) Start(ctx context.Context) error          { return m.StartFunc(ctx) }
-func (m *mockMessageConsumer) Stop(ctx context.Context) error           { return m.StopFunc(ctx) }
-func (m *mockMessageConsumer) Messages() <-chan messagepipeline.Message { return m.messageChannel }
+func (m *mockMessageConsumer) Start(ctx context.Context) error { return m.StartFunc(ctx) }
+func (m *mockMessageConsumer) Stop(ctx context.Context) error  { return m.StopFunc(ctx) }
+func (m *mockMessageConsumer) Messages() <-chan messagepipeline.Message {
+	return m.messageChannel
+}
 func (m *mockMessageConsumer) Done() <-chan struct{} {
 	done := make(chan struct{})
 	close(done)
@@ -38,9 +40,11 @@ func TestService_Lifecycle(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	t.Cleanup(cancel)
 
-	// Arrange: Create nil dependencies as they aren't used in this lifecycle test.
+	// Arrange: Create dependencies. Only the config types are needed for this test.
 	deps := &routing.Dependencies{}
-	cfg := pipeline.Config{NumWorkers: 1}
+	pipelineCfg := pipeline.Config{NumWorkers: 1}
+	// The service now requires the top-level routing config as well.
+	routingCfg := &routing.Config{}
 
 	// Arrange: Create the mock consumer and track its method calls.
 	startCalled := false
@@ -56,8 +60,8 @@ func TestService_Lifecycle(t *testing.T) {
 		return nil
 	}
 
-	// Act: Create the service using the refactored constructor, injecting the mock.
-	service, err := pipeline.NewService(cfg, deps, mockConsumer, zerolog.Nop())
+	// Act: Create the service using the updated constructor signature.
+	service, err := pipeline.NewService(pipelineCfg, deps, routingCfg, mockConsumer, zerolog.Nop())
 	require.NoError(t, err)
 
 	// Act & Assert for Start

@@ -26,7 +26,15 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
-// mockPushNo
+// --- Test Helpers ---
+
+type mockTokenFetcher struct{}
+
+func (m *mockTokenFetcher) Fetch(context.Context, urn.URN) ([]routing.DeviceToken, error) {
+	return nil, fmt.Errorf("no tokens found") // Force offline path
+}
+func (m *mockTokenFetcher) Close() error { return nil }
+
 func TestPipeline_OfflineStorage_Integration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	t.Cleanup(cancel)
@@ -67,7 +75,9 @@ func TestPipeline_OfflineStorage_Integration(t *testing.T) {
 	require.NoError(t, err)
 
 	// 4. Assemble and start the ENTIRE processing pipeline
-	pipelineService, err := pipeline.NewService(pipeline.Config{NumWorkers: 1}, deps, consumer, logger)
+	// CORRECTED: Pass the new, required routing.Config to the service constructor.
+	routingCfg := &routing.Config{}
+	pipelineService, err := pipeline.NewService(pipeline.Config{NumWorkers: 1}, deps, routingCfg, consumer, logger)
 	require.NoError(t, err)
 
 	pipelineCtx, cancelPipeline := context.WithCancel(ctx)
@@ -88,16 +98,11 @@ func TestPipeline_OfflineStorage_Integration(t *testing.T) {
 	payload, err := protojson.Marshal(protoEnv)
 	require.NoError(t, err)
 
-	topicName := fmt.Sprintf("projects/%s/topics/%s", projectID, ingressTopicID)
-
-	publisher := psClient.Publisher(topicName)
-
-	result := publisher.Publish(ctx, &pubsub.Message{Data: payload})
+	result := psClient.Publisher(ingressTopicID).Publish(ctx, &pubsub.Message{Data: payload})
 	_, err = result.Get(ctx)
 	require.NoError(t, err)
 
 	// 6. Assert: Wait for the pipeline to process and store the message.
-	// Use require.Eventually to poll Firestore until the message appears.
 	require.Eventually(t, func() bool {
 		docs, err := fsClient.Collection("user-messages").Doc(recipientURN.String()).Collection("messages").Documents(ctx).GetAll()
 		return err == nil && len(docs) == 1
@@ -115,15 +120,6 @@ func TestPipeline_OfflineStorage_Integration(t *testing.T) {
 	assert.Equal(t, originalEnvelope.EncryptedData, storedEnvelope.EncryptedData, "EncryptedData was corrupted in the pipeline")
 	t.Log("✅ Pipeline integration test passed. Data integrity verified.")
 }
-
-// --- Test Helpers ---
-
-type mockTokenFetcher struct{}
-
-func (m *mockTokenFetcher) Fetch(context.Context, urn.URN) ([]routing.DeviceToken, error) {
-	return nil, fmt.Errorf("no tokens found") // Force offline path
-}
-func (m *mockTokenFetcher) Close() error { return nil }
 
 func createPubsubResources(t *testing.T, ctx context.Context, client *pubsub.Client, projectID, topicID, subID string) {
 	t.Helper()

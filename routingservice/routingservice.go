@@ -33,14 +33,19 @@ func New(
 	logger zerolog.Logger,
 ) (*Wrapper, error) {
 
-	// 1. Create the standard base server. It includes /healthz, /readyz, /metrics.
+	// 1. Create the standard base server.
 	baseServer := microservice.NewBaseServer(logger, cfg.HTTPListenAddr)
 
-	// 2. Create the core message processing pipeline.
-	pipelineConfig := pipeline.Config{
-		NumWorkers: cfg.NumPipelineWorkers,
-	}
-	processingService, err := pipeline.NewService(pipelineConfig, deps, consumer, logger)
+	// 2. Create the core message processing pipeline by calling its dedicated constructor.
+	// This now passes the main routing config down to the pipeline so the new
+	// processor can access the DeliveryTopicID.
+	processingService, err := pipeline.NewService(
+		pipeline.Config{NumWorkers: cfg.NumPipelineWorkers},
+		deps,
+		cfg,
+		consumer,
+		logger,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create pipeline service: %w", err)
 	}
@@ -48,17 +53,12 @@ func New(
 	// 3. Create service-specific API handlers.
 	apiHandler := api.NewAPI(producer, deps.MessageStore, logger)
 
-	// 4. Get the mux and middleware from the base library.
+	// 4. Register service-specific routes with the centralized middleware.
 	mux := baseServer.Mux()
 	jwtAuth := middleware.NewJWTAuthMiddleware(cfg.JWTSecret)
 	cors := middleware.NewCorsMiddleware(cfg.CorsConfig)
-
-	// 5. Register service-specific routes with the centralized middleware.
 	mux.Handle("POST /send", cors(jwtAuth(http.HandlerFunc(apiHandler.SendHandler))))
 	mux.Handle("GET /messages", cors(jwtAuth(http.HandlerFunc(apiHandler.GetMessagesHandler))))
-
-	// CORRECTED: Add explicit handlers for preflight OPTIONS requests.
-	// These handlers only need to run the CORS middleware to return the correct headers.
 	preflightHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
@@ -102,7 +102,6 @@ func (w *Wrapper) Shutdown(ctx context.Context) error {
 		finalErr = err
 	}
 
-	// Wait for any in-flight API goroutines (like message deletions) to complete.
 	w.logger.Info().Msg("Waiting for background API tasks to finish...")
 	w.apiHandler.Wait()
 	w.logger.Info().Msg("Background tasks finished.")

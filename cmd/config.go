@@ -7,7 +7,6 @@ import (
 //go:embed prod/config.yaml
 var ConfigYAML []byte
 
-// REFACTOR: Added structs to support selectable cache backends.
 type YamlRedisConfig struct {
 	Addr string `yaml:"addr"`
 }
