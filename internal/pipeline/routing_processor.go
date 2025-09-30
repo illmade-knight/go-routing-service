@@ -7,16 +7,14 @@ import (
 
 	"github.com/illmade-knight/go-dataflow/pkg/messagepipeline"
 	"github.com/illmade-knight/go-routing-service/pkg/routing"
+	"github.com/illmade-knight/go-routing-service/routingservice/config"
 	"github.com/illmade-knight/go-secure-messaging/pkg/transport"
 	"github.com/rs/zerolog"
 )
 
-// New creates the main message handler (StreamProcessor) for the routing pipeline.
-// It determines user presence and routes messages to the correct delivery channel:
-// 1. Online Users: Publishes to the real-time delivery bus.
-// 2. Offline Users (Mobile): Stores message and triggers a push notification.
-// 3. Offline Users (Web): Publishes to the real-time delivery bus for in-app notification on next connect.
-func New(deps *routing.Dependencies, cfg *routing.Config, logger zerolog.Logger) messagepipeline.StreamProcessor[transport.SecureEnvelope] {
+// NewRoutingProcessor creates the main message handler (StreamProcessor) for the routing pipeline.
+// It determines user presence and routes messages to the correct delivery channel.
+func NewRoutingProcessor(deps *routing.Dependencies, cfg *config.AppConfig, logger zerolog.Logger) messagepipeline.StreamProcessor[transport.SecureEnvelope] {
 	return func(ctx context.Context, msg messagepipeline.Message, envelope *transport.SecureEnvelope) error {
 		recipientURN := envelope.RecipientID
 		procLogger := logger.With().Str("recipient_id", recipientURN.String()).Str("message_id", envelope.MessageID).Logger()
@@ -24,7 +22,6 @@ func New(deps *routing.Dependencies, cfg *routing.Config, logger zerolog.Logger)
 		// 1. Check if the user is online via the presence cache.
 		if _, err := deps.PresenceCache.Fetch(ctx, recipientURN); err == nil {
 			procLogger.Info().Msg("User is online. Routing message to real-time delivery bus.")
-			// ARCHITECTURE FIX: Publish to the single, shared delivery topic for any online instance to pick up.
 			err := deps.DeliveryProducer.Publish(ctx, cfg.DeliveryTopicID, envelope)
 			if err != nil {
 				return fmt.Errorf("failed to publish to delivery bus for online user: %w", err)
@@ -61,8 +58,7 @@ func New(deps *routing.Dependencies, cfg *routing.Config, logger zerolog.Logger)
 
 		var firstErr error
 
-		// 4. FEATURE: Handle web notifications by publishing to the delivery bus.
-		// The ConnectionManager will deliver this to the client when they next connect.
+		// 4. Handle web notifications by publishing to the delivery bus.
 		if hasWebToken {
 			procLogger.Info().Msg("Found 'web' token. Routing notification to real-time delivery bus.")
 			err := deps.DeliveryProducer.Publish(ctx, cfg.DeliveryTopicID, envelope)
@@ -84,8 +80,6 @@ func New(deps *routing.Dependencies, cfg *routing.Config, logger zerolog.Logger)
 			}
 		}
 
-		// If all dispatching fails, the message has already been processed as much as possible for this attempt.
-		// The message should be NACK'd so the DLQ policy can eventually take over. Returning an error achieves this.
 		if firstErr != nil {
 			procLogger.Error().Err(firstErr).Msg("One or more dispatch methods failed. The message will be NACK'd for retry.")
 			return firstErr

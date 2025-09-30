@@ -13,6 +13,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/illmade-knight/go-dataflow/pkg/cache"
 	"github.com/illmade-knight/go-dataflow/pkg/messagepipeline"
+	"github.com/illmade-knight/go-microservice-base/pkg/middleware"
 	"github.com/illmade-knight/go-routing-service/pkg/routing"
 	"github.com/illmade-knight/go-secure-messaging/pkg/transport"
 	"github.com/illmade-knight/go-secure-messaging/pkg/urn"
@@ -70,7 +71,9 @@ func setup(t *testing.T) *testFixture {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		require.NoError(t, err)
 		go func() {
-			defer conn.Close()
+			defer func() {
+				_ = conn.Close()
+			}()
 			for {
 				_, msg, err := conn.ReadMessage()
 				if err != nil {
@@ -86,11 +89,21 @@ func setup(t *testing.T) *testFixture {
 	require.NoError(t, err)
 
 	t.Cleanup(func() {
-		wsClientConn.Close()
+		_ = wsClientConn.Close()
 		wsServer.Close()
 	})
 
-	cm, err := NewConnectionManager(":0", "secret", presenceCache, consumer, zerolog.Nop())
+	// REFACTORED: Create a mock auth middleware that simulates a successful login.
+	// This aligns the test with the new dependency injection pattern.
+	mockAuthMiddleware := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// The connect handler requires a user ID in the context.
+			ctx := middleware.ContextWithUserID(r.Context(), "test-user")
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+
+	cm, err := NewConnectionManager(":0", mockAuthMiddleware, presenceCache, consumer, zerolog.Nop())
 	require.NoError(t, err)
 
 	userURN, err := urn.Parse("urn:sm:user:test-user")
@@ -194,7 +207,7 @@ func TestConnectionManager_DeliveryProcessor(t *testing.T) {
 		fx.cm.add(fx.userURN, fx.wsClientConn)
 		_, err := fx.presenceCache.Fetch(context.Background(), fx.userURN)
 		require.NoError(t, err, "Precondition failed: user should be in presence cache")
-		fx.wsClientConn.Close()
+		_ = fx.wsClientConn.Close()
 
 		envelope := &transport.SecureEnvelope{
 			MessageID:   "test-msg-789",

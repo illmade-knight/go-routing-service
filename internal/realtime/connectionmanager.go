@@ -31,7 +31,6 @@ type ConnectionManager struct {
 	presenceCache    cache.PresenceCache[urn.URN, routing.ConnectionInfo]
 	deliveryPipeline *messagepipeline.StreamingService[transport.SecureEnvelope]
 	logger           zerolog.Logger
-	jwtSecret        string
 	instanceID       string
 
 	mu          sync.RWMutex
@@ -41,7 +40,7 @@ type ConnectionManager struct {
 // NewConnectionManager creates a new, fully configured ConnectionManager.
 func NewConnectionManager(
 	listenAddr string,
-	jwtSecret string,
+	authMiddleware func(http.Handler) http.Handler, // CHANGED: Accept the middleware directly
 	presenceCache cache.PresenceCache[urn.URN, routing.ConnectionInfo],
 	deliveryConsumer messagepipeline.MessageConsumer,
 	logger zerolog.Logger,
@@ -52,7 +51,6 @@ func NewConnectionManager(
 	cm := &ConnectionManager{
 		presenceCache: presenceCache,
 		logger:        cmLogger,
-		jwtSecret:     jwtSecret,
 		instanceID:    instanceID,
 		connections:   make(map[string]*websocket.Conn),
 		upgrader: websocket.Upgrader{
@@ -63,7 +61,6 @@ func NewConnectionManager(
 	}
 
 	// 1. Assemble the internal pipeline for processing real-time delivery messages.
-	// This pipeline consumes messages from the delivery bus and processes them locally.
 	deliveryPipeline, err := messagepipeline.NewStreamingService[transport.SecureEnvelope](
 		messagepipeline.StreamingServiceConfig{
 			NumWorkers: 1,
@@ -80,8 +77,8 @@ func NewConnectionManager(
 
 	// 2. Set up the HTTP server for WebSocket connections.
 	mux := http.NewServeMux()
-	jwtAuth := middleware.NewJWTAuthMiddleware(cm.jwtSecret)
-	mux.Handle("/connect", jwtAuth(http.HandlerFunc(cm.connectHandler)))
+	// Use the injected middleware directly.
+	mux.Handle("/connect", authMiddleware(http.HandlerFunc(cm.connectHandler)))
 	cm.server = &http.Server{
 		Addr:    listenAddr,
 		Handler: mux,
@@ -156,7 +153,6 @@ func (cm *ConnectionManager) Remove(userURN urn.URN) {
 }
 
 // deliveryProcessor is the StreamProcessor for the internal delivery pipeline.
-// It checks if the recipient is connected to this specific server instance and delivers the message.
 func (cm *ConnectionManager) deliveryProcessor(_ context.Context, _ messagepipeline.Message, envelope *transport.SecureEnvelope) error {
 	recipientURN := envelope.RecipientID
 	conn, ok := cm.Get(recipientURN)
