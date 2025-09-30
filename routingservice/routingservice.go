@@ -11,6 +11,7 @@ import (
 	"github.com/illmade-knight/go-routing-service/internal/api"
 	"github.com/illmade-knight/go-routing-service/internal/pipeline"
 	"github.com/illmade-knight/go-routing-service/pkg/routing"
+	"github.com/illmade-knight/go-routing-service/routingservice/config"
 	"github.com/illmade-knight/go-secure-messaging/pkg/transport"
 	"github.com/rs/zerolog"
 )
@@ -18,7 +19,6 @@ import (
 // Wrapper now embeds BaseServer to get standard server functionality.
 type Wrapper struct {
 	*microservice.BaseServer
-	cfg               *routing.Config
 	processingService *messagepipeline.StreamingService[transport.SecureEnvelope]
 	apiHandler        *api.API
 	logger            zerolog.Logger
@@ -26,39 +26,36 @@ type Wrapper struct {
 
 // New creates and wires up the entire routing service using the base server.
 func New(
-	cfg *routing.Config,
+	cfg *config.AppConfig,
 	deps *routing.Dependencies,
-	consumer messagepipeline.MessageConsumer,
-	producer routing.IngestionProducer,
+	authMiddleware func(http.Handler) http.Handler,
 	logger zerolog.Logger,
 ) (*Wrapper, error) {
 
 	// 1. Create the standard base server.
-	baseServer := microservice.NewBaseServer(logger, cfg.HTTPListenAddr)
+	// CORRECTED: Use the APIPort field from the AppConfig.
+	baseServer := microservice.NewBaseServer(logger, ":"+cfg.APIPort)
 
-	// 2. Create the core message processing pipeline by calling its dedicated constructor.
-	// This now passes the main routing config down to the pipeline so the new
-	// processor can access the DeliveryTopicID.
-	processingService, err := pipeline.NewService(
-		pipeline.Config{NumWorkers: cfg.NumPipelineWorkers},
-		deps,
-		cfg,
-		consumer,
-		logger,
-	)
+	// 2. Create the core message processing pipeline.
+	processingService, err := newCoreProcessingPipeline(cfg, deps, logger)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create pipeline service: %w", err)
+		return nil, err
 	}
 
-	// 3. Create service-specific API handlers.
-	apiHandler := api.NewAPI(producer, deps.MessageStore, logger)
+	// 3. Create the API handlers.
+	apiHandler := api.NewAPI(deps.IngestionProducer, deps.MessageStore, logger)
 
-	// 4. Register service-specific routes with the centralized middleware.
+	// 4. Register routes and apply middleware.
 	mux := baseServer.Mux()
-	jwtAuth := middleware.NewJWTAuthMiddleware(cfg.JWTSecret)
-	cors := middleware.NewCorsMiddleware(cfg.CorsConfig)
-	mux.Handle("POST /send", cors(jwtAuth(http.HandlerFunc(apiHandler.SendHandler))))
-	mux.Handle("GET /messages", cors(jwtAuth(http.HandlerFunc(apiHandler.GetMessagesHandler))))
+	cors := middleware.NewCorsMiddleware(middleware.CorsConfig{
+		AllowedOrigins: cfg.Cors.AllowedOrigins,
+		Role:           middleware.CorsRole(cfg.Cors.Role),
+	})
+
+	mux.Handle("POST /send", cors(authMiddleware(http.HandlerFunc(apiHandler.SendHandler))))
+	mux.Handle("GET /messages", cors(authMiddleware(http.HandlerFunc(apiHandler.GetMessagesHandler))))
+
+	// Handle preflight requests
 	preflightHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
@@ -67,11 +64,27 @@ func New(
 
 	return &Wrapper{
 		BaseServer:        baseServer,
-		cfg:               cfg,
 		processingService: processingService,
 		apiHandler:        apiHandler,
 		logger:            logger,
 	}, nil
+}
+
+// newCoreProcessingPipeline assembles the background message processing service.
+func newCoreProcessingPipeline(
+	cfg *config.AppConfig,
+	deps *routing.Dependencies,
+	logger zerolog.Logger,
+) (*messagepipeline.StreamingService[transport.SecureEnvelope], error) {
+	processor := pipeline.NewRoutingProcessor(deps, cfg, logger)
+
+	return messagepipeline.NewStreamingService[transport.SecureEnvelope](
+		messagepipeline.StreamingServiceConfig{NumWorkers: cfg.NumPipelineWorkers},
+		deps.IngestionConsumer,
+		pipeline.EnvelopeTransformer,
+		processor,
+		logger,
+	)
 }
 
 // Start runs the service's background components before starting the base HTTP server.
@@ -97,15 +110,18 @@ func (w *Wrapper) Shutdown(ctx context.Context) error {
 		finalErr = err
 	}
 
+	w.apiHandler.Wait() // Wait for any background API tasks (e.g., message deletion) to finish.
+
 	if err := w.BaseServer.Shutdown(ctx); err != nil {
 		w.logger.Error().Err(err).Msg("HTTP server shutdown failed.")
 		finalErr = err
 	}
 
-	w.logger.Info().Msg("Waiting for background API tasks to finish...")
-	w.apiHandler.Wait()
-	w.logger.Info().Msg("Background tasks finished.")
-
-	w.logger.Info().Msg("Service shutdown complete.")
+	w.logger.Info().Msg("All components shut down.")
 	return finalErr
+}
+
+// Wait blocks until all background API tasks (e.g., message deletion) are complete.
+func (w *Wrapper) Wait() {
+	w.apiHandler.Wait()
 }

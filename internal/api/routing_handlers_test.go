@@ -148,6 +148,8 @@ func TestGetMessagesHandler(t *testing.T) {
 		store := new(mockMessageStore)
 		apiHandler := api.NewAPI(nil, store, zerolog.Nop())
 		store.On("RetrieveMessages", mock.Anything, authedUserURN).Return(testMessages, nil)
+		// THE FIRST FIX: Add the missing expectation for the background deletion call.
+		store.On("DeleteMessages", mock.Anything, authedUserURN, []string{"msg-1", "msg-2"}).Return(nil)
 
 		req := httptest.NewRequest(http.MethodGet, "/messages", nil)
 		ctx := middleware.ContextWithUserID(context.Background(), authedUserURN.EntityID())
@@ -159,11 +161,14 @@ func TestGetMessagesHandler(t *testing.T) {
 
 		// Assert
 		assert.Equal(t, http.StatusOK, rr.Code)
-		store.AssertExpectations(t)
 		var responseList transport.SecureEnvelopeListPb
 		err := protojson.Unmarshal(rr.Body.Bytes(), &responseList)
 		require.NoError(t, err)
 		assert.Len(t, responseList.Envelopes, 2)
+
+		// THE SECOND FIX: Wait for the background task to complete before finishing the test.
+		apiHandler.Wait()
+		store.AssertExpectations(t)
 	})
 
 	t.Run("Success - No Messages Found", func(t *testing.T) {

@@ -1,10 +1,11 @@
-// The runroutingservice command is the main entrypoint for the routing service.
 package main
 
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/firestore"
@@ -24,59 +25,62 @@ import (
 	"github.com/illmade-knight/go-routing-service/internal/test/fakes"
 	"github.com/illmade-knight/go-routing-service/pkg/routing"
 	"github.com/illmade-knight/go-routing-service/routingservice"
+	"github.com/illmade-knight/go-routing-service/routingservice/config"
 	"github.com/illmade-knight/go-secure-messaging/pkg/urn"
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
-	"gopkg.in/yaml.v3"
 )
 
-// main wires up all production dependencies and starts the service.
 func main() {
 	logger := zerolog.New(os.Stdout).With().Timestamp().Logger()
 	ctx := context.Background()
 
 	cfg := loadConfig(logger)
 
+	authMiddleware, err := newAuthMiddleware(cfg, logger)
+	if err != nil {
+		logger.Fatal().Err(err).Msg("Failed to create auth middleware")
+	}
+
 	// --- Client Initialization ---
 	psClient, err := pubsub.NewClient(ctx, cfg.ProjectID)
 	if err != nil {
 		logger.Fatal().Err(err).Msg("Failed to create Pub/Sub client")
 	}
-	defer func() { _ = psClient.Close() }()
+	defer func() {
+		_ = psClient.Close()
+	}()
 
 	fsClient, err := firestore.NewClient(ctx, cfg.ProjectID)
 	if err != nil {
 		logger.Fatal().Err(err).Msg("Failed to create Firestore client")
 	}
-	defer func() { _ = fsClient.Close() }()
+	defer func() {
+		_ = fsClient.Close()
+	}()
 
 	// --- Dependency Assembly ---
-	presenceCache, err := setupPresenceCache(ctx, cfg, fsClient, logger)
-	if err != nil {
-		logger.Fatal().Err(err).Msg("Failed to create presence cache")
-	}
-	defer func() { _ = presenceCache.Close() }()
-
-	deliveryProducer, deliveryConsumer, ingressConsumer, cleanup, err := setupMessageBus(ctx, cfg, psClient, logger)
-	if err != nil {
-		logger.Fatal().Err(err).Msg("Failed to set up message bus")
-	}
-	defer cleanup()
-
-	dependencies, err := assembleDependencies(ctx, cfg, psClient, fsClient, deliveryProducer, logger)
+	dependencies, cleanup, err := assembleDependencies(ctx, cfg, psClient, fsClient, logger)
 	if err != nil {
 		logger.Fatal().Err(err).Msg("Failed to assemble service dependencies")
 	}
+	defer cleanup()
 
 	// --- Service Assembly ---
-	apiService, err := assembleAPIService(cfg, dependencies, ingressConsumer, psClient.Publisher(cfg.IngressTopicID), logger)
+	apiService, err := routingservice.New(cfg, dependencies, authMiddleware, logger)
 	if err != nil {
 		logger.Fatal().Err(err).Msg("Failed to create API service")
 	}
 
-	connManager, err := assembleConnectionManager(cfg, presenceCache, deliveryConsumer, logger)
+	connManager, err := realtime.NewConnectionManager(
+		":"+cfg.WebSocketPort,
+		authMiddleware,
+		dependencies.PresenceCache,
+		dependencies.DeliveryConsumer,
+		logger,
+	)
 	if err != nil {
 		logger.Fatal().Err(err).Msg("Failed to create Connection Manager")
 	}
@@ -85,117 +89,105 @@ func main() {
 	app.Run(ctx, logger, apiService, connManager)
 }
 
-// --- Configuration & Setup ---
-
-func loadConfig(logger zerolog.Logger) *cmd.AppConfig {
-	var cfg cmd.YamlConfig
-	if err := yaml.Unmarshal(cmd.ConfigYAML, &cfg); err != nil {
-		logger.Fatal().Err(err).Msg("Failed to parse embedded config.yaml")
+func assembleDependencies(ctx context.Context, cfg *config.AppConfig, psClient *pubsub.Client, fsClient *firestore.Client, logger zerolog.Logger) (*routing.Dependencies, func(), error) {
+	// Build all real dependencies
+	ingressProducer := psub.NewProducer(psClient.Publisher(cfg.IngressTopicID))
+	ingressConsumer, err := setupProductionIngress(ctx, cfg, psClient, logger)
+	if err != nil {
+		return nil, nil, err
+	}
+	deliveryProducer, deliveryConsumer, deliveryCleanup, err := setupProductionDeliveryBus(ctx, cfg, psClient, logger)
+	if err != nil {
+		return nil, nil, err
+	}
+	messageStore, err := persistence.NewFirestoreStore(fsClient, logger)
+	if err != nil {
+		deliveryCleanup()
+		return nil, nil, err
+	}
+	presenceCache, err := setupPresenceCache(ctx, cfg, fsClient, logger)
+	if err != nil {
+		deliveryCleanup()
+		return nil, nil, err
+	}
+	tokenFetcher, err := newFirestoreTokenFetcher(ctx, cfg, fsClient, logger)
+	if err != nil {
+		deliveryCleanup()
+		return nil, nil, err
 	}
 
-	appCfg := &cmd.AppConfig{
-		ProjectID:                cfg.ProjectID,
-		RunMode:                  cfg.RunMode,
-		APIPort:                  cfg.APIPort,
-		WebSocketPort:            cfg.WebSocketPort,
-		Cors:                     cfg.Cors,
-		PresenceCache:            cfg.PresenceCache,
-		IngressTopicID:           cfg.IngressTopicID,
-		IngressSubscriptionID:    cfg.IngressSubscriptionID,
-		IngressTopicDLQID:        cfg.IngressTopicDLQID,
-		DeliveryTopicID:          cfg.DeliveryTopicID,
-		PushNotificationsTopicID: cfg.PushNotificationsTopicID,
-		JWTSecret:                os.Getenv("JWT_SECRET"),
-	}
-
-	if appCfg.ProjectID == "" || appCfg.ProjectID == "<your-gcp-project-id>" {
-		logger.Fatal().Msg("FATAL: project_id is not set in config.yaml.")
-	}
-	if appCfg.JWTSecret == "" {
-		logger.Fatal().Msg("FATAL: JWT_SECRET environment variable is not set.")
-	}
-	if appCfg.RunMode != "local" && appCfg.IngressTopicDLQID == "" {
-		logger.Fatal().Msg("FATAL: ingress_topic_dlq_id must be set in production mode.")
-	}
-
-	logger.Info().Str("run_mode", appCfg.RunMode).Str("project_id", appCfg.ProjectID).Msg("Configuration loaded.")
-	return appCfg
-}
-
-func setupPresenceCache(ctx context.Context, cfg *cmd.AppConfig, fsClient *firestore.Client, logger zerolog.Logger) (cache.PresenceCache[urn.URN, routing.ConnectionInfo], error) {
-	cacheType := cfg.PresenceCache.Type
-	logger.Info().Str("type", cacheType).Msg("Initializing presence cache...")
-
-	switch cacheType {
-	case "redis":
-		return cache.NewRedisPresenceCache[urn.URN, routing.ConnectionInfo](
-			ctx,
-			&cache.RedisConfig{Addr: cfg.PresenceCache.Redis.Addr, CacheTTL: 24 * time.Hour},
-			logger,
-		)
-	case "firestore":
-		return cache.NewFirestorePresenceCache[urn.URN, routing.ConnectionInfo](
-			fsClient,
-			cfg.PresenceCache.Firestore.CollectionName,
-		)
-	case "inmemory":
-		return cache.NewInMemoryPresenceCache[urn.URN, routing.ConnectionInfo](), nil
-	default:
-		return nil, fmt.Errorf("invalid presence_cache type specified in config.yaml: %s", cacheType)
-	}
-}
-
-// setupMessageBus configures and returns the message bus components based on the run mode.
-func setupMessageBus(ctx context.Context, cfg *cmd.AppConfig, client *pubsub.Client, logger zerolog.Logger) (*websocket.DeliveryProducer, messagepipeline.MessageConsumer, messagepipeline.MessageConsumer, func(), error) {
+	// --- Conditional PushNotifier ---
+	var pushNotifier routing.PushNotifier
 	if cfg.RunMode == "local" {
-		logger.Warn().Msg("RUN_MODE=local DETECTED. Using IN-MEMORY message bus.")
-		dp, dc, ic := setupLocalBus(logger)
-		return dp, dc, ic, func() {}, nil
+		logger.Warn().Msg("Using FAKE push notifier for local development.")
+		pushNotifier = fakes.NewPushNotifier(logger)
+	} else {
+		logger.Info().Msg("Using PRODUCTION Pub/Sub push notifier.")
+		pushNotifier, err = newPushNotifier(ctx, cfg, psClient, logger)
+		if err != nil {
+			deliveryCleanup()
+			return nil, nil, err
+		}
 	}
 
-	logger.Info().Msg("Using PRODUCTION GCP Pub/Sub message bus.")
-	deliveryProducer, deliveryConsumer, cleanupDelivery, err := setupProductionDeliveryBus(ctx, cfg, client, logger)
-	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("failed to set up production delivery bus: %w", err)
-	}
-
-	ingressConsumer, cleanupIngress, err := setupProductionIngress(ctx, cfg, client, logger)
-	if err != nil {
-		cleanupDelivery()
-		return nil, nil, nil, nil, fmt.Errorf("failed to set up production ingress: %w", err)
+	deps := &routing.Dependencies{
+		IngestionProducer:  ingressProducer,
+		IngestionConsumer:  ingressConsumer,
+		DeliveryProducer:   deliveryProducer,
+		DeliveryConsumer:   deliveryConsumer,
+		MessageStore:       messageStore,
+		PresenceCache:      presenceCache,
+		DeviceTokenFetcher: tokenFetcher,
+		PushNotifier:       pushNotifier,
 	}
 
 	cleanup := func() {
-		cleanupDelivery()
-		cleanupIngress()
+		deliveryCleanup()
+		_ = presenceCache.Close()
 	}
-	return deliveryProducer, deliveryConsumer, ingressConsumer, cleanup, nil
+
+	return deps, cleanup, nil
 }
 
-// setupLocalBus creates in-memory message buses for local development.
-func setupLocalBus(logger zerolog.Logger) (*websocket.DeliveryProducer, messagepipeline.MessageConsumer, messagepipeline.MessageConsumer) {
-	ingestionEventProducer := fakes.NewProducer(logger)
-	ingressConsumer := fakes.NewInMemoryConsumer(100, logger)
-	go func() {
-		for msgData := range ingestionEventProducer.Published() {
-			ingressConsumer.Publish(messagepipeline.Message{MessageData: msgData})
-		}
-	}()
+// --- Configuration & Setup Helpers ---
 
-	deliveryEventProducer := fakes.NewProducer(logger)
-	deliveryConsumer := fakes.NewInMemoryConsumer(100, logger)
-	go func() {
-		for msgData := range deliveryEventProducer.Published() {
-			deliveryConsumer.Publish(messagepipeline.Message{MessageData: msgData})
-		}
-	}()
-
-	deliveryProducer := websocket.NewDeliveryProducer(deliveryEventProducer)
-	return deliveryProducer, deliveryConsumer, ingressConsumer
+func loadConfig(logger zerolog.Logger) *config.AppConfig {
+	cfg, err := cmd.Load()
+	if err != nil {
+		logger.Fatal().Err(err).Msg("Failed to load embedded config")
+	}
+	if idURL := os.Getenv("IDENTITY_SERVICE_URL"); idURL != "" {
+		cfg.IdentityServiceURL = idURL
+	}
+	if port := os.Getenv("PORT"); port != "" {
+		cfg.APIPort = port
+	}
+	if cfg.ProjectID == "" {
+		logger.Fatal().Msg("FATAL: project_id is not set in config.yaml.")
+	}
+	if cfg.IdentityServiceURL == "" {
+		logger.Fatal().Msg("FATAL: identity_service_url is not set in config.yaml or IDENTITY_SERVICE_URL env var.")
+	}
+	if cfg.RunMode != "local" && cfg.IngressTopicDLQID == "" {
+		logger.Fatal().Msg("FATAL: ingress_topic_dlq_id must be set in production mode for the Dead-Letter Queue.")
+	}
+	if cfg.DeliveryBusSubscriptionExpiration == "" {
+		cfg.DeliveryBusSubscriptionExpiration = "24h"
+	} else {
+		logger.Info().Str("expires", cfg.DeliveryBusSubscriptionExpiration).Msg("EXPIRES")
+	}
+	logger.Info().Str("run_mode", cfg.RunMode).Str("project_id", cfg.ProjectID).Msg("Configuration loaded.")
+	return cfg
 }
 
-// setupProductionIngress creates the main ingress subscription with a Dead-Letter Queue policy.
-func setupProductionIngress(ctx context.Context, cfg *cmd.AppConfig, client *pubsub.Client, logger zerolog.Logger) (messagepipeline.MessageConsumer, func(), error) {
+func newAuthMiddleware(cfg *config.AppConfig, logger zerolog.Logger) (func(http.Handler) http.Handler, error) {
+	sanitizedBaseURL := strings.Trim(cfg.IdentityServiceURL, "\"")
+	jwksURL := sanitizedBaseURL + "/.well-known/jwks.json"
+	logger.Info().Str("url", jwksURL).Msg("Configuring JWKS client")
+	return middleware.NewJWKSAuthMiddleware(jwksURL)
+}
+
+func setupProductionIngress(ctx context.Context, cfg *config.AppConfig, client *pubsub.Client, logger zerolog.Logger) (messagepipeline.MessageConsumer, error) {
 	subAdminClient := client.SubscriptionAdminClient
 	subPath := fmt.Sprintf("projects/%s/subscriptions/%s", cfg.ProjectID, cfg.IngressSubscriptionID)
 	topicPath := fmt.Sprintf("projects/%s/topics/%s", cfg.ProjectID, cfg.IngressTopicID)
@@ -212,27 +204,21 @@ func setupProductionIngress(ctx context.Context, cfg *cmd.AppConfig, client *pub
 				AckDeadlineSeconds: 10,
 			})
 			if err != nil {
-				return nil, func() {}, fmt.Errorf("failed to create ingress subscription with DLQ: %w", err)
+				return nil, fmt.Errorf("failed to create ingress subscription with DLQ: %w", err)
 			}
 		} else {
-			return nil, func() {}, fmt.Errorf("failed to get ingress subscription: %w", err)
+			return nil, fmt.Errorf("failed to get ingress subscription: %w", err)
 		}
 	} else {
 		logger.Info().Str("subscription", subPath).Msg("Ingress subscription already exists.")
 	}
 
-	consumer, err := messagepipeline.NewGooglePubsubConsumer(
+	return messagepipeline.NewGooglePubsubConsumer(
 		messagepipeline.NewGooglePubsubConsumerDefaults(cfg.IngressSubscriptionID), client, logger,
 	)
-	if err != nil {
-		return nil, func() {}, fmt.Errorf("failed to create ingress consumer: %w", err)
-	}
-
-	return consumer, func() {}, nil // No cleanup needed for persistent subscription
 }
 
-// setupProductionDeliveryBus creates the producer and consumer for the real-time Pub/Sub bus.
-func setupProductionDeliveryBus(ctx context.Context, cfg *cmd.AppConfig, client *pubsub.Client, logger zerolog.Logger) (*websocket.DeliveryProducer, messagepipeline.MessageConsumer, func(), error) {
+func setupProductionDeliveryBus(ctx context.Context, cfg *config.AppConfig, client *pubsub.Client, logger zerolog.Logger) (*websocket.DeliveryProducer, messagepipeline.MessageConsumer, func(), error) {
 	dataflowProducer, err := messagepipeline.NewGooglePubsubProducer(
 		messagepipeline.NewGooglePubsubProducerDefaults(cfg.DeliveryTopicID), client, logger,
 	)
@@ -241,16 +227,35 @@ func setupProductionDeliveryBus(ctx context.Context, cfg *cmd.AppConfig, client 
 	}
 	deliveryProducer := websocket.NewDeliveryProducer(dataflowProducer)
 
-	topicPath := fmt.Sprintf("projects/%s/topics/%s", cfg.ProjectID, cfg.DeliveryTopicID)
 	subID := fmt.Sprintf("delivery-sub-%s", uuid.NewString())
 	subPath := fmt.Sprintf("projects/%s/subscriptions/%s", cfg.ProjectID, subID)
+	topicPath := fmt.Sprintf("projects/%s/topics/%s", cfg.ProjectID, cfg.DeliveryTopicID)
+
+	_, err = client.TopicAdminClient.CreateTopic(ctx, &pubsubpb.Topic{Name: topicPath})
+	if err != nil {
+		// Use status.Code() to get the gRPC code from the error.
+		st, ok := status.FromError(err)
+		if ok && st.Code() == codes.AlreadyExists {
+			// If the topic already exists, it's not a failure for our use case.
+			fmt.Printf("Topic %s already exists. All good! 👍\n", topicPath)
+		} else {
+			// For any other error, we return it.
+			return nil, nil, nil, fmt.Errorf("failed to create topic: %w", err)
+		}
+	}
+
 	subAdminClient := client.SubscriptionAdminClient
+
+	exp, err := time.ParseDuration(cfg.DeliveryBusSubscriptionExpiration)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("invalid delivery_bus_subscription_expiration: %w", err)
+	}
 
 	sub, err := subAdminClient.CreateSubscription(ctx, &pubsubpb.Subscription{
 		Name:               subPath,
 		Topic:              topicPath,
 		AckDeadlineSeconds: 10,
-		ExpirationPolicy:   &pubsubpb.ExpirationPolicy{Ttl: &durationpb.Duration{Seconds: 3600}},
+		ExpirationPolicy:   &pubsubpb.ExpirationPolicy{Ttl: durationpb.New(exp)},
 	})
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to create ephemeral subscription: %w", err)
@@ -271,71 +276,21 @@ func setupProductionDeliveryBus(ctx context.Context, cfg *cmd.AppConfig, client 
 	return deliveryProducer, deliveryConsumer, cleanupFunc, nil
 }
 
-// --- Service Assembly ---
-
-func assembleDependencies(ctx context.Context, cfg *cmd.AppConfig, psClient *pubsub.Client, fsClient *firestore.Client, deliveryProducer *websocket.DeliveryProducer, logger zerolog.Logger) (*routing.Dependencies, error) {
-	messageStore, err := persistence.NewFirestoreStore(fsClient, logger)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Firestore message store: %w", err)
+func setupPresenceCache(ctx context.Context, cfg *config.AppConfig, fsClient *firestore.Client, logger zerolog.Logger) (cache.PresenceCache[urn.URN, routing.ConnectionInfo], error) {
+	cacheType := cfg.PresenceCache.Type
+	logger.Info().Str("type", cacheType).Msg("Initializing presence cache...")
+	switch cacheType {
+	case "firestore":
+		return cache.NewFirestorePresenceCache[urn.URN, routing.ConnectionInfo](
+			fsClient,
+			cfg.PresenceCache.Firestore.CollectionName,
+		)
+	default:
+		return nil, fmt.Errorf("invalid presence_cache type: %s", cacheType)
 	}
-
-	tokenFetcher, err := newFirestoreTokenFetcher(ctx, cfg, fsClient, logger)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Firestore token fetcher: %w", err)
-	}
-
-	pushProducer, err := messagepipeline.NewGooglePubsubProducer(
-		messagepipeline.NewGooglePubsubProducerDefaults(cfg.PushNotificationsTopicID), psClient, logger,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create push notification producer: %w", err)
-	}
-	pushNotifier, err := push.NewPubSubNotifier(pushProducer, logger)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create push notifier: %w", err)
-	}
-
-	return &routing.Dependencies{
-		DeliveryProducer:   deliveryProducer,
-		DeviceTokenFetcher: tokenFetcher,
-		PushNotifier:       pushNotifier,
-		MessageStore:       messageStore,
-	}, nil
 }
 
-func assembleAPIService(cfg *cmd.AppConfig, deps *routing.Dependencies, ingressConsumer messagepipeline.MessageConsumer, publisher *pubsub.Publisher, logger zerolog.Logger) (*routingservice.Wrapper, error) {
-	var corsRole middleware.CorsRole
-	if cfg.Cors.Role == "admin" {
-		corsRole = middleware.CorsRoleAdmin
-	}
-	ingressProducer := psub.NewProducer(publisher)
-
-	return routingservice.New(
-		&routing.Config{
-			HTTPListenAddr:     ":" + cfg.APIPort,
-			NumPipelineWorkers: 5,
-			JWTSecret:          cfg.JWTSecret,
-			CorsConfig:         middleware.CorsConfig{AllowedOrigins: cfg.Cors.AllowedOrigins, Role: corsRole},
-			DeliveryTopicID:    cfg.DeliveryTopicID,
-		},
-		deps,
-		ingressConsumer,
-		ingressProducer,
-		logger,
-	)
-}
-
-func assembleConnectionManager(cfg *cmd.AppConfig, presenceCache cache.PresenceCache[urn.URN, routing.ConnectionInfo], deliveryConsumer messagepipeline.MessageConsumer, logger zerolog.Logger) (*realtime.ConnectionManager, error) {
-	return realtime.NewConnectionManager(
-		":"+cfg.WebSocketPort,
-		cfg.JWTSecret,
-		presenceCache,
-		deliveryConsumer,
-		logger,
-	)
-}
-
-func newFirestoreTokenFetcher(ctx context.Context, cfg *cmd.AppConfig, fsClient *firestore.Client, logger zerolog.Logger) (cache.Fetcher[urn.URN, []routing.DeviceToken], error) {
+func newFirestoreTokenFetcher(ctx context.Context, cfg *config.AppConfig, fsClient *firestore.Client, logger zerolog.Logger) (cache.Fetcher[urn.URN, []routing.DeviceToken], error) {
 	stringDocFetcher, err := cache.NewFirestore[string, persistence.DeviceTokenDoc](
 		ctx,
 		&cache.FirestoreConfig{ProjectID: cfg.ProjectID, CollectionName: "device-tokens"},
@@ -347,4 +302,14 @@ func newFirestoreTokenFetcher(ctx context.Context, cfg *cmd.AppConfig, fsClient 
 	}
 	stringTokenFetcher := &persistence.FirestoreTokenAdapter{DocFetcher: stringDocFetcher}
 	return persistence.NewURNTokenFetcherAdapter(stringTokenFetcher), nil
+}
+
+func newPushNotifier(ctx context.Context, cfg *config.AppConfig, psClient *pubsub.Client, logger zerolog.Logger) (routing.PushNotifier, error) {
+	pushProducer, err := messagepipeline.NewGooglePubsubProducer(
+		messagepipeline.NewGooglePubsubProducerDefaults(cfg.PushNotificationsTopicID), psClient, logger,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create push notification producer: %w", err)
+	}
+	return push.NewPubSubNotifier(pushProducer, logger)
 }

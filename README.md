@@ -4,7 +4,7 @@ The **go-routing-service** is a high-performance, secure, and scalable microserv
 
 ### **Architecture**
 
-The service is built on a go-microservice-base library and features a robust, scalable architecture composed of two primary services that can be scaled independently.
+The service is built on the go-microservice-base library and features a robust, scalable architecture composed of two primary services that can be scaled independently.
 
 * **Stateless API & Processing Service**: A standard HTTP server for message ingestion (/send), retrieval of offline messages (/messages), and observability. This service also runs the core background pipeline that processes all incoming messages.
 * **Stateful WebSocket Service**: A dedicated server that manages persistent WebSocket connections, tracks real-time user presence in a shared cache (e.g., Redis, Firestore), and handles direct message delivery.
@@ -27,7 +27,7 @@ The core processing pipeline intelligently routes messages based on the recipien
 * **Efficient Web Client Notifications**: Leverages the real-time delivery bus to notify offline web clients, avoiding the complexity of browser push services for a more efficient in-app notification experience.
 * **Configuration-Driven**: A single entrypoint uses an embedded config.yaml and environment variables to wire up dependencies for different environments.
 * **Selectable Backends**: The PresenceCache can be configured to use Redis, Firestore, or an in-memory store.
-* **Secure & Standardized**: Hardened against sender spoofing and uses centralized JWT authentication and configurable CORS policies.
+* **Secure & Standardized**: Hardened against sender spoofing and uses centralized, asymmetric (RS256) JWT authentication and configurable CORS policies.
 * **Resilient**: Utilizes Dead-Letter Queues (DLQs) to handle "poison pill" messages and prevent pipeline blockage.
 
 ### **Configuration**
@@ -41,7 +41,7 @@ The service is configured via config.yaml for non-secret values and environment 
 
 1. **Configure config.yaml**: Set your project\_id and other desired values in cmd/runroutingservice/prod/config.yaml.
 2. **Set Environment Variables**:  
-   export JWT\_SECRET="a-very-secure-secret-key"
+   export IDENTITY\_SERVICE\_URL="http://localhost:3000"
 
 3. **Run the Service**:  
    \# For production mode (requires gcloud auth)  
